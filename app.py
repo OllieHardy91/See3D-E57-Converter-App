@@ -940,11 +940,15 @@ class See3DConverterApp(ctk.CTk):
             self._dropzone._set_images(str(root / "images"))
         if not self._out_var.get():
             self._set_output(str(root / "Colmap"))
-        # Cross-fill the Validate tab so the user doesn't re-enter paths
+        # Cross-fill the Validate tab so the user doesn't re-enter paths.
+        # Only point at Colmap/ when it actually exists, otherwise the slot
+        # immediately reads "Missing: cameras.txt, images.txt" before the
+        # conversion has even been run.
         if not self._val_drop.var_e57.get():
             self._val_drop._set_e57(path)
-        if not self._val_drop.var_images.get():
-            self._val_drop._set_images(str(root / "Colmap"))
+        colmap_dir = root / "Colmap"
+        if colmap_dir.is_dir() and not self._val_drop.var_images.get():
+            self._val_drop._set_images(str(colmap_dir))
         self._refresh_summary()
 
     def _on_images_change(self, path: str):
@@ -1068,13 +1072,17 @@ class See3DConverterApp(ctk.CTk):
         except Exception as exc:
             return f"Pre-flight check failed:\n{exc}"
         try:
-            parent = outp.parent if not outp.exists() else outp
-            parent.mkdir(parents=True, exist_ok=True)
             import shutil
-            free_gb = shutil.disk_usage(parent).free / 1e9
+            # Walk up to the nearest existing ancestor for the disk-space probe.
+            # Don't create the output dir here — pre-flight may still bail
+            # out below and we'd leave a stray empty folder behind.
+            check_at = outp
+            while not check_at.exists() and check_at != check_at.parent:
+                check_at = check_at.parent
+            free_gb = shutil.disk_usage(check_at).free / 1e9
             est_gb = n_img * 0.05 + 1.0
             if free_gb < est_gb:
-                return (f"Low disk space at {parent}:\n"
+                return (f"Low disk space at {check_at}:\n"
                         f"  {free_gb:.1f} GB free, need ~{est_gb:.1f} GB.")
         except Exception:
             pass

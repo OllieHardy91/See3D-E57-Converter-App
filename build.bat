@@ -20,12 +20,18 @@ if exist dist  rmdir /s /q dist
 
 echo.
 echo [2/4] Installing dependencies...
-REM Layout-agnostic: prefer ..\requirements.txt (gui_app layout in origin),
-REM then requirements.txt (flat layout in public), then fall back to inline.
-if exist "..\requirements.txt" (
-    %PY% -m pip install -r ..\requirements.txt --quiet
+REM Prefer requirements-dev.txt (includes pyinstaller). Fall back to
+REM requirements.txt + a direct pyinstaller install. Layout-agnostic:
+REM works whether build.bat sits under gui_app/ (origin) or at the repo
+REM root (public).
+if exist "..\requirements-dev.txt" (
+    %PY% -m pip install -r ..\requirements-dev.txt --quiet
+) else if exist "requirements-dev.txt" (
+    %PY% -m pip install -r requirements-dev.txt --quiet
+) else if exist "..\requirements.txt" (
+    %PY% -m pip install -r ..\requirements.txt pyinstaller --quiet
 ) else if exist "requirements.txt" (
-    %PY% -m pip install -r requirements.txt --quiet
+    %PY% -m pip install -r requirements.txt pyinstaller --quiet
 ) else (
     %PY% -m pip install customtkinter pillow pyinstaller numpy scipy opencv-python pye57 tqdm tkinterdnd2 --quiet
 )

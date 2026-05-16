@@ -1,0 +1,8 @@
+# See3D E57 Converter - build / development dependencies
+# Installs everything in requirements.txt plus the .exe packager.
+# build.bat installs from this file.
+
+-r requirements.txt
+
+# ---- packaging ----
+pyinstaller>=6.10

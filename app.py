@@ -125,17 +125,24 @@ def _open_path(p: Path) -> None:
 
 
 def _set_app_icon(window: tk.Misc) -> None:
-    """Cross-platform icon setter - .ico on Windows, PhotoImage elsewhere."""
+    """Cross-platform window icon setter.
+
+    Uses the platform-native bundled icon when available (.ico on Windows,
+    .icns on macOS — both derived from assets/Final_Icon.png at build time)
+    and falls back to assets/Final_Icon.png loaded as a Tk PhotoImage.
+    """
     try:
         if sys.platform.startswith("win"):
             ico = resource_path("assets/app_icon.ico")
             if ico.exists():
                 window.iconbitmap(str(ico))
                 return
-        # Prefer the new light-bg icon; fall back to the dark legacy one if missing
-        png = resource_path("assets/favicon-light-512.png")
+        # Non-Windows runtime (and Win fallback): load Final_Icon.png directly.
+        # Earlier versions fell back to favicon-light/dark-512.png; those are
+        # the auto-generated wordmark and don't match the polished app icon.
+        png = resource_path("assets/Final_Icon.png")
         if not png.exists():
-            png = resource_path("assets/favicon-dark-512.png")
+            png = resource_path("assets/favicon-light-512.png")
         if png.exists():
             img = tk.PhotoImage(file=str(png))
             window.iconphoto(True, img)

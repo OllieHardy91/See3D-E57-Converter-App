@@ -38,8 +38,8 @@ if exist "..\requirements-dev.txt" (
 if errorlevel 1 ( echo ERROR: pip install failed & pause & exit /b 1 )
 
 echo.
-echo [3/4] Generating premium multi-size ICO (mono small, wordmark large)...
-%PY% scripts\generate_icon_source.py
+echo [3/4] Building multi-size app_icon.ico from assets/Final_Icon.png...
+%PY% -c "from PIL import Image; img = Image.open('assets/Final_Icon.png').convert('RGBA'); img.save('assets/app_icon.ico', format='ICO', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])"
 if errorlevel 1 ( echo WARNING: icon conversion failed, building without icon )
 
 echo.

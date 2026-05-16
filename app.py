@@ -1156,7 +1156,10 @@ class See3DConverterApp(ctk.CTk):
         self._prog.set(0)
         self._stat_lbl.configure(text="Starting...", text_color=C_ACCENT2)
         self._clear_log()
-        self._switch("Logs")
+        # Stay on the Convert tab so users watch the progress bar fill instead
+        # of reading a log scroll — a determinate progress bar is a much better
+        # waiting-time signal. Users can switch to Logs manually via the
+        # "View log" button that appears once the run completes.
         self._last_output = output
 
         def _cb(frac, phase=""):
@@ -1263,7 +1266,9 @@ class See3DConverterApp(ctk.CTk):
                                   text_color=C_HINT)
         self._ovr_frame.grid_remove()
         self._clear_log()
-        self._switch("Logs")
+        # Stay on the Validate tab so the user sees the live score/status
+        # update rather than the log scroll. We switch to Logs only if the
+        # validation actually fails (see _on_val_done).
         self._append_log("-- Alignment validation -----------------------------\n")
         threading.Thread(target=self._val_worker, args=(colmap, e57), daemon=True).start()
 

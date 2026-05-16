@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 
 # Converts Realsee scan-world frame (Y-down after pose) to COLMAP Z-up world.
 # Applied identically to points AND poses - do not modify.

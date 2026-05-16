@@ -115,7 +115,10 @@ def _set_app_icon(window: tk.Misc) -> None:
             if ico.exists():
                 window.iconbitmap(str(ico))
                 return
-        png = resource_path("assets/favicon-dark-512.png")
+        # Prefer the new light-bg icon; fall back to the dark legacy one if missing
+        png = resource_path("assets/favicon-light-512.png")
+        if not png.exists():
+            png = resource_path("assets/favicon-dark-512.png")
         if png.exists():
             img = tk.PhotoImage(file=str(png))
             window.iconphoto(True, img)

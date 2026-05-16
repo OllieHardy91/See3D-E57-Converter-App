@@ -3,7 +3,7 @@
 A desktop GUI for converting **Realsee Galois M2** LiDAR captures into a
 [COLMAP](https://colmap.github.io/)-compatible dataset ready for Gaussian Splatting training.
 
-![See3D E57 Converter](assets/favicon-dark-512.png)
+![See3D E57 Converter](assets/favicon-light-512.png)
 
 ---
 

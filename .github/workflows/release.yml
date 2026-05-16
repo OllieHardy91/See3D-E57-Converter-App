@@ -33,11 +33,9 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
 
-      - name: Generate premium multi-size .ico
+      - name: Build app_icon.ico from Final_Icon.png
         run: |
-          # Wordmark at 64/128/256, '3D' monogram at 16/32/48 - matches
-          # the macOS sibling app and Apple's own pro-app icon pattern.
-          python scripts/generate_icon_source.py
+          python -c "from PIL import Image; img = Image.open('assets/Final_Icon.png').convert('RGBA'); img.save('assets/app_icon.ico', format='ICO', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])" 
 
       - name: Build EXE
         run: |

@@ -1,0 +1,7 @@
+dist/
+build/
+__pycache__/
+*.pyc
+*.spec
+*.e57
+See3D_E57_Converter.exe

@@ -23,7 +23,7 @@ Design:
 from __future__ import annotations
 from pathlib import Path
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 HERE   = Path(__file__).resolve().parent.parent
 ASSETS = HERE / "assets"
@@ -109,6 +109,15 @@ def build_monogram_image(src: Image.Image) -> Image.Image:
     return canvas
 
 
+def _magick_available() -> bool:
+    import subprocess as _sp
+    try:
+        _sp.run(["magick", "--version"], capture_output=True, check=True, timeout=5)
+        return True
+    except Exception:
+        return False
+
+
 def main() -> None:
     src_path = ASSETS / "See3D Vector.png"
     if not src_path.exists():
@@ -134,27 +143,47 @@ def main() -> None:
     fav.save(ASSETS / "favicon-light-512.png", "PNG", optimize=True)
     print(f"Wrote favicon-light-512.png  (512x512)")
 
-    # ---- Multi-size Windows .ico (Final_Icon.png is the agreed app icon) ----
-    # Crop tight to the squircle content before scaling — the source PNG has
-    # ~230px transparent padding on each side (content fills only ~62% of
-    # canvas). Without cropping, the taskbar icon appears tiny and blurry.
-    ico_path = ASSETS / "app_icon.ico"
-    final_icon_path = ASSETS / "Final_Icon.png"
-    if not final_icon_path.exists():
-        raise SystemExit(f"Missing {final_icon_path}")
-    final_icon = Image.open(final_icon_path).convert("RGBA")
-    bbox = final_icon.getbbox()   # tight box of non-transparent pixels
-    if bbox:
-        pad = int((bbox[2] - bbox[0]) * 0.04)   # 4% padding each side
-        x0 = max(0, bbox[0] - pad)
-        y0 = max(0, bbox[1] - pad)
-        x1 = min(final_icon.width,  bbox[2] + pad)
-        y1 = min(final_icon.height, bbox[3] + pad)
-        final_icon = final_icon.crop((x0, y0, x1, y1))
-    sizes = [16, 24, 32, 48, 64, 128, 256]
-    sources = [(s, final_icon) for s in sizes]
-    _write_multi_source_ico(ico_path, sources)
-    print(f"Wrote app_icon.ico  ({len(sources)} sizes, source: Final_Icon.png, cropped)")
+    # ---- Multi-size Windows .ico ----
+    # Prefer SVG + ImageMagick: renders each size from vector geometry so edges
+    # are mathematically sharp at every resolution (especially the taskbar sizes).
+    # Falls back to PIL + PNG crop if magick is not on PATH or SVG is missing.
+    ico_path   = ASSETS / "app_icon.ico"
+    svg_path   = ASSETS / "Final_Icon.svg"
+    png_path   = ASSETS / "Final_Icon.png"
+    sizes      = [16, 24, 32, 48, 64, 128, 256]
+
+    if svg_path.exists() and _magick_available():
+        print("  ICO: rendering from SVG via ImageMagick (vector-sharp)")
+        import subprocess as _sp
+        from io import BytesIO as _BytesIO
+        sources = []
+        for size in sizes:
+            result = _sp.run(
+                ["magick", "-background", "none",
+                 str(svg_path), "-resize", f"{size}x{size}",
+                 "PNG:-"],
+                capture_output=True, check=True,
+            )
+            img = Image.open(_BytesIO(result.stdout)).convert("RGBA")
+            sources.append((size, img))
+        _write_multi_source_ico(ico_path, sources)
+        print(f"Wrote app_icon.ico  ({len(sizes)} sizes, SVG source)")
+    else:
+        print("  ICO: falling back to PNG (install ImageMagick for sharper icons)")
+        if not png_path.exists():
+            raise SystemExit(f"Missing {png_path}")
+        final_icon = Image.open(png_path).convert("RGBA")
+        bbox = final_icon.getbbox()
+        if bbox:
+            pad = int((bbox[2] - bbox[0]) * 0.04)
+            final_icon = final_icon.crop((
+                max(0, bbox[0] - pad), max(0, bbox[1] - pad),
+                min(final_icon.width,  bbox[2] + pad),
+                min(final_icon.height, bbox[3] + pad),
+            ))
+        sources = [(s, final_icon) for s in sizes]
+        _write_multi_source_ico(ico_path, sources)
+        print(f"Wrote app_icon.ico  ({len(sizes)} sizes, PNG source)")
 
 
 def _write_multi_source_ico(out_path: Path,
@@ -169,6 +198,8 @@ def _write_multi_source_ico(out_path: Path,
     pngs: list[tuple[int, bytes]] = []
     for size, src in entries:
         im = src.resize((size, size), Image.LANCZOS).convert("RGBA")
+        if size <= 48:
+            im = im.filter(ImageFilter.UnsharpMask(radius=0.6, percent=180, threshold=2))
         buf = BytesIO()
         im.save(buf, format="PNG", optimize=True)
         pngs.append((size, buf.getvalue()))

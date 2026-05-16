@@ -23,8 +23,8 @@ echo [2/4] Installing dependencies from requirements.txt...
 if errorlevel 1 ( echo ERROR: pip install failed & pause & exit /b 1 )
 
 echo.
-echo [3/4] Generating multi-size ICO from dark 512px favicon...
-%PY% -c "from PIL import Image; src=Image.open('assets/favicon-dark-512.png').convert('RGBA'); sizes=[(s,s) for s in (16,32,48,64,128,256)]; imgs=[src.resize(s,Image.LANCZOS) for s in sizes]; imgs[0].save('assets/app_icon.ico',format='ICO',sizes=sizes,append_images=imgs[1:])"
+echo [3/4] Generating premium multi-size ICO (mono small, wordmark large)...
+%PY% scripts\generate_icon_source.py
 if errorlevel 1 ( echo WARNING: icon conversion failed, building without icon )
 
 echo.

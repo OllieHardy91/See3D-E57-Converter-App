@@ -6,7 +6,8 @@ echo -- See3D E57 Converter -- PyInstaller build --
 REM Pick a Python launcher: prefer venv if present, then py -3.11, then python
 set "PY=python"
 where py >nul 2>&1 && set "PY=py -3.11"
-if exist ".venv\Scripts\python.exe" set "PY=.venv\Scripts\python.exe"
+if exist "..\.venv\Scripts\python.exe"   set "PY=..\.venv\Scripts\python.exe"
+if exist ".venv\Scripts\python.exe"      set "PY=.venv\Scripts\python.exe"
 
 echo Using Python: %PY%
 %PY% --version
@@ -18,8 +19,16 @@ if exist build rmdir /s /q build
 if exist dist  rmdir /s /q dist
 
 echo.
-echo [2/4] Installing dependencies from requirements.txt...
-%PY% -m pip install -r requirements.txt --quiet
+echo [2/4] Installing dependencies...
+REM Layout-agnostic: prefer ..\requirements.txt (gui_app layout in origin),
+REM then requirements.txt (flat layout in public), then fall back to inline.
+if exist "..\requirements.txt" (
+    %PY% -m pip install -r ..\requirements.txt --quiet
+) else if exist "requirements.txt" (
+    %PY% -m pip install -r requirements.txt --quiet
+) else (
+    %PY% -m pip install customtkinter pillow pyinstaller numpy scipy opencv-python pye57 tqdm tkinterdnd2 --quiet
+)
 if errorlevel 1 ( echo ERROR: pip install failed & pause & exit /b 1 )
 
 echo.
@@ -66,8 +75,13 @@ echo [4/4] Building .exe with PyInstaller (onefile, no UPX)...
 if errorlevel 1 ( echo ERROR: PyInstaller build failed & pause & exit /b 1 )
 
 echo.
+echo Copying .exe to project root...
+copy /Y "dist\See3D_E57_Converter.exe" "..\See3D_E57_Converter.exe"
+if errorlevel 1 ( echo ERROR: copy failed & pause & exit /b 1 )
+
+echo.
 echo -- BUILD COMPLETE --
-echo See3D_E57_Converter.exe is in dist\
+echo See3D_E57_Converter.exe is in the project root.
 echo (First launch unpacks to %%TEMP%% and may take 5-15 seconds.)
 pause
 endlocal

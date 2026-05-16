@@ -1,4 +1,4 @@
-name: Build release binaries
+name: Build Windows EXE
 
 on:
   push:
@@ -87,81 +87,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/See3D_E57_Converter.exe
-          fail_on_unmatched_files: true
-          generate_release_notes: true
-
-  build-macos:
-    runs-on: macos-latest
-    timeout-minutes: 30
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements-dev.txt
-
-      - name: Build .app
-        run: |
-          python -m PyInstaller --windowed --noconfirm --noupx \
-            --name "See3D_E57_Converter" \
-            --add-data "assets:assets" \
-            --hidden-import numpy \
-            --hidden-import scipy \
-            --hidden-import scipy.spatial \
-            --hidden-import scipy.spatial.transform \
-            --hidden-import scipy.spatial.transform._rotation_groups \
-            --hidden-import cv2 \
-            --hidden-import pye57 \
-            --hidden-import tqdm \
-            --hidden-import tqdm.auto \
-            --hidden-import PIL \
-            --hidden-import PIL.Image \
-            --hidden-import customtkinter \
-            --hidden-import tkinterdnd2 \
-            --collect-data customtkinter \
-            --collect-data tkinterdnd2 \
-            --collect-data cv2 \
-            --collect-binaries cv2 \
-            --collect-binaries pye57 \
-            --exclude-module torch \
-            --exclude-module torchvision \
-            --exclude-module torchaudio \
-            --exclude-module tensorflow \
-            --exclude-module jax \
-            --exclude-module matplotlib \
-            --exclude-module IPython \
-            --exclude-module sklearn \
-            --exclude-module pandas \
-            --exclude-module pytest \
-            --exclude-module notebook \
-            app.py
-
-      - name: Zip .app bundle
-        working-directory: dist
-        run: |
-          # `.app` is a directory under the hood — distribute as zip so the
-          # Finder treats it as a single download.
-          zip -ry See3D_E57_Converter-macos.zip See3D_E57_Converter.app
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: See3D_E57_Converter-macos
-          path: dist/See3D_E57_Converter-macos.zip
-
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/See3D_E57_Converter-macos.zip
           fail_on_unmatched_files: true
           generate_release_notes: true

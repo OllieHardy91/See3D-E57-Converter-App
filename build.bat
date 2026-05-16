@@ -5,8 +5,8 @@ echo -- See3D E57 Converter -- PyInstaller build --
 
 REM Pick a Python launcher: prefer venv if present, then py -3.11, then python
 set "PY=python"
-if exist ".venv\Scripts\python.exe" set "PY=.venv\Scripts\python.exe"
 where py >nul 2>&1 && set "PY=py -3.11"
+if exist ".venv\Scripts\python.exe" set "PY=.venv\Scripts\python.exe"
 
 echo Using Python: %PY%
 %PY% --version

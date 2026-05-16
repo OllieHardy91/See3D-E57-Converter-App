@@ -53,18 +53,35 @@ _BTN_SEC = dict(fg_color=C_CARD, border_color=C_ACCENT2, border_width=2,
                 text_color=C_ACCENT2, hover_color="#EEF2FA")
 
 # Font fallback chain: Windows 11 -> Windows 10 -> macOS -> generic
-_DISPLAY_FAMILIES = "Segoe UI Variable Display Segoe UI SF Pro Display Helvetica"
-_TEXT_FAMILIES    = "Segoe UI Variable Text Segoe UI SF Pro Text Helvetica"
-_MONO_FAMILIES    = "Consolas Menlo Monaco monospace"
+_DISPLAY_FAMILIES = ("Segoe UI Variable Display", "Segoe UI", "SF Pro Display", "Helvetica Neue", "Helvetica")
+_TEXT_FAMILIES    = ("Segoe UI Variable Text",    "Segoe UI", "SF Pro Text",    "Helvetica Neue", "Helvetica")
+_MONO_FAMILIES    = ("Consolas", "Menlo", "Monaco", "Courier New", "Courier")
+
+_FAMILY_CACHE: dict[tuple, str] = {}
+
+
+def _pick_family(candidates: tuple[str, ...]) -> str:
+    """First family from `candidates` that Tk reports as installed; falls back to the last entry."""
+    cached = _FAMILY_CACHE.get(candidates)
+    if cached is not None:
+        return cached
+    try:
+        from tkinter import font as tkfont
+        available = set(tkfont.families())
+    except Exception:
+        available = set()
+    chosen = next((c for c in candidates if c in available), candidates[-1])
+    _FAMILY_CACHE[candidates] = chosen
+    return chosen
 
 
 def _f(size: int, weight: str = "normal", mono: bool = False) -> ctk.CTkFont:
     if mono:
-        family = "Consolas"
+        family = _pick_family(_MONO_FAMILIES)
     elif size >= 14:
-        family = "Segoe UI Variable Display"
+        family = _pick_family(_DISPLAY_FAMILIES)
     else:
-        family = "Segoe UI Variable Text"
+        family = _pick_family(_TEXT_FAMILIES)
     return ctk.CTkFont(family=family, size=size, weight=weight)
 
 
@@ -149,7 +166,7 @@ class _Tip:
         tw.wm_geometry(f"+{x}+{y}")
         tw.attributes("-topmost", True)
         tk.Label(tw, text=self._text, background=C_NAVY, foreground="white",
-                 font=("Segoe UI Variable Text", 10), relief="flat",
+                 font=(_pick_family(_TEXT_FAMILIES), 10), relief="flat",
                  padx=10, pady=7, wraplength=320, justify="left").pack()
 
     def _hide(self, _=None):
@@ -1281,7 +1298,7 @@ class See3DConverterApp(ctk.CTk):
             self._score_status.configure(text="GOOD", text_color=C_SUCCESS)
             self._score_sub.configure(text="Healthy alignment  (target 5-9)",
                                       text_color=C_SUCCESS)
-        elif score <= 11.5:
+        elif score < 12:
             self._score_num.configure(text=f"{score:.1f}", text_color=C_WARN)
             self._score_status.configure(text="MARGINAL", text_color=C_WARN)
             self._score_sub.configure(

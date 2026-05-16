@@ -40,6 +40,16 @@ your_dataset/
 
 ## Installation
 
+### Pre-built Windows EXE (easiest)
+
+Grab `See3D_E57_Converter.exe` from
+[Releases](https://github.com/OllieHardy91/See3D-E57-Converter-App/releases)
+and double-click. No installer, no admin rights. On first launch Windows
+SmartScreen may warn that it's from an "unrecognised publisher" — click
+*More info* → *Run anyway*.
+
+### From source
+
 **Python 3.10 or 3.11 recommended.**
 
 ```bash
@@ -47,13 +57,8 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Or double-click **`build.bat`** to produce a standalone `.exe` (requires PyInstaller):
-
-```
-build.bat
-```
-
-The exe will appear as `See3D_E57_Converter.exe` in the same folder.
+Or double-click **`build.bat`** to produce a standalone `.exe` (requires PyInstaller).
+The built `.exe` will appear in `dist/`.
 
 ---
 
@@ -73,7 +78,13 @@ The exe will appear as `See3D_E57_Converter.exe` in the same folder.
 | Custom | — | Manual point budget |
 
 5. Click **CONVERT** — progress updates live as each scan is processed
+   (you can press **CANCEL** at any point; the current cubemap finishes,
+   then the worker pool exits)
 6. Switch to the **Validate** tab to check alignment quality after conversion
+
+The app runs a pre-flight check before starting: missing files, panorama /
+scan-count mismatch, and low disk space are surfaced as a modal warning so
+you don't wait five minutes only to discover the inputs don't match.
 
 ---
 
@@ -90,8 +101,8 @@ without re-running alignment validation:
 
 Alignment validation score guide:
 - **5–9** — healthy, expected range for a well-captured M2 dataset
-- **10–14** — marginal, check panorama count matches scan count
-- **15+** — issue — verify the `.e57` and images folder belong to the same capture
+- **10–11** — marginal, check panorama count matches scan count
+- **12+** — issue — verify the `.e57` and images folder belong to the same capture
 
 ---
 

@@ -1,8 +1,18 @@
-customtkinter>=5.2.0
-Pillow>=10.0.0
-numpy>=1.24.0
-scipy>=1.10.0
-opencv-python>=4.7.0
-pye57>=0.4.0
-tqdm>=4.65.0
-tkinterdnd2>=0.3.0
+# See3D E57 Converter - Python dependencies
+# Pinned to versions known to build cleanly with PyInstaller on Windows + Python 3.11.
+
+# ---- core numerics / I/O ----
+numpy>=1.26,<3.0
+scipy>=1.13
+opencv-python>=4.10
+pye57>=0.4.11
+tqdm>=4.66
+
+# ---- GUI ----
+customtkinter>=5.2.2
+tkinterdnd2>=0.4.2
+Pillow>=10.4
+
+# Build-time deps (pyinstaller, etc.) live in requirements-dev.txt to keep
+# `pip install -r requirements.txt` lean for users who only want to run from
+# source rather than build a .exe.

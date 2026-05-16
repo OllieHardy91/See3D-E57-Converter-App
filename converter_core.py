@@ -1,20 +1,23 @@
 # converter_core.py
-# Unified Realsee Galois M2 → COLMAP converter (6-face and 4-face modes).
-# Adapted from FINAL/convert.py — calibration constants must not change.
-# See CLAUDE.md for the empirical validation history behind these defaults.
+# Realsee Galois M2 -> COLMAP converter (6-face and 4-face modes).
+# Calibration constants must not change. See CLAUDE.md for the empirical
+# validation history behind these defaults.
 
 from __future__ import annotations
 
 import os
 import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 
+__version__ = "1.1.3"
+
 # Converts Realsee scan-world frame (Y-down after pose) to COLMAP Z-up world.
-# Applied identically to points AND poses — do not modify.
+# Applied identically to points AND poses - do not modify.
 FLIP_MAT = np.array([
     [1, 0,  0, 0],
     [0, 0, -1, 0],
@@ -32,7 +35,7 @@ NADIR_ZENITH_FACES = ("py", "ny")
 
 # Camera-to-scan-local rotations per cubemap face.
 # Validated against both residential (223-scan) and commercial (45-scan) M2
-# datasets. Changing any entry breaks alignment — re-validate before touching.
+# datasets. Changing any entry breaks alignment - re-validate before touching.
 FACE_ROTATIONS = {
     "pz": np.eye(3, dtype=np.float64),
     "nz": np.array([[-1, 0, 0], [0, 1, 0], [0, 0, -1]], dtype=np.float64),
@@ -43,7 +46,7 @@ FACE_ROTATIONS = {
 }
 
 
-# ── lazy imports ─────────────────────────────────────────────────────────────
+# ---- lazy imports ----------------------------------------------------------
 
 @lru_cache(maxsize=1)
 def load_cv2():
@@ -78,10 +81,38 @@ def load_tqdm():
         raise SystemExit("Missing 'tqdm'. Run: pip install tqdm") from e
 
 
-# ── file helpers ──────────────────────────────────────────────────────────────
+# ---- safe E57 handle -------------------------------------------------------
+
+@contextmanager
+def open_e57(path):
+    """Context manager wrapper around pye57.E57 to ensure the C++ handle
+    is released promptly. pye57 may or may not expose .close() depending on
+    version, so we fall back to del + the GC."""
+    pye57 = load_pye57()
+    handle = pye57.E57(str(path))
+    try:
+        yield handle
+    finally:
+        try:
+            close = getattr(handle, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+        del handle
+
+
+def get_e57_scan_count(path) -> int:
+    """Open the e57 just long enough to read scan_count, then release."""
+    with open_e57(path) as h:
+        return int(h.scan_count)
+
+
+# ---- file helpers ----------------------------------------------------------
 
 def _natural_key(p: Path) -> list:
     return [int(s) if s.isdigit() else s for s in re.split(r"(\d+)", p.name.lower())]
+
 
 def list_panoramas(images_dir: Path) -> list[Path]:
     if not images_dir.is_dir():
@@ -96,7 +127,14 @@ def list_panoramas(images_dir: Path) -> list[Path]:
     return imgs
 
 
-# ── cubemap generation ────────────────────────────────────────────────────────
+def count_panoramas(images_dir: Path) -> int:
+    if not images_dir.is_dir():
+        return 0
+    return sum(1 for p in images_dir.iterdir()
+               if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"})
+
+
+# ---- cubemap generation ----------------------------------------------------
 
 def precompute_face_maps(face_size: int) -> dict:
     u = np.linspace(-1, 1, face_size, dtype=np.float32)
@@ -159,14 +197,45 @@ def process_panorama(
         cv2.imwrite(str(out), face_img)
 
 
-def _detect_face_size(images: list[Path], face_size: int | None) -> tuple[int, int]:
+# Worker-pool globals - populated by _worker_init in each subprocess so the
+# face_maps dict is built once per worker instead of pickled with every task.
+_W_FACE_MAPS: dict | None = None
+_W_YAW_PX: int = 0
+_W_OUT_DIR: Path | None = None
+_W_NZ_DIR: Path | None = None
+
+
+def _worker_init(face_size: int, yaw_offset_px: int,
+                 out_dir: str, nz_dir: str | None) -> None:
+    global _W_FACE_MAPS, _W_YAW_PX, _W_OUT_DIR, _W_NZ_DIR
+    _W_FACE_MAPS = precompute_face_maps(face_size)
+    _W_YAW_PX    = yaw_offset_px
+    _W_OUT_DIR   = Path(out_dir)
+    _W_NZ_DIR    = Path(nz_dir) if nz_dir else None
+
+
+def _worker_run(image_id: int, pano_path: str) -> None:
+    process_panorama(image_id, Path(pano_path),
+                     _W_OUT_DIR, _W_YAW_PX, _W_FACE_MAPS, _W_NZ_DIR)
+
+
+def _detect_pano_width(images: list[Path]) -> int:
     cv2 = load_cv2()
     for p in images:
         img = cv2.imread(str(p), cv2.IMREAD_COLOR)
         if img is not None:
-            w = img.shape[1]
-            return w, face_size or (w // 4)
+            return img.shape[1]
     raise RuntimeError("Failed to load any panorama image")
+
+
+def _emit_progress(cb, frac: float, phase: str = "") -> None:
+    if cb is None:
+        return
+    try:
+        cb(frac, phase)
+    except TypeError:
+        # Backwards compat: older single-arg callbacks.
+        cb(frac)
 
 
 def convert_panoramas_to_cubemaps(
@@ -177,41 +246,65 @@ def convert_panoramas_to_cubemaps(
     workers: int | None,
     nadir_zenith_dir: Path | None = None,
     progress_callback=None,
+    cancel_event=None,
 ) -> int:
     tqdm = load_tqdm()
-    pano_w, fs = _detect_face_size(images, face_size)
+    pano_w = _detect_pano_width(images)
+    fs = face_size or (pano_w // 4)
     yaw_px = int(round((yaw_offset_deg / 360.0) * pano_w))
-    face_maps = precompute_face_maps(fs)
-    max_w = max(1, workers or min(len(images), os.cpu_count() or 1))
     total = len(images)
+
+    # Default to a conservative worker count - more than 8 risks RAM pressure
+    # because each worker holds a precomputed face_maps dict (~750 MB at fs=4000).
+    cpu = os.cpu_count() or 1
+    if workers is None or workers <= 0:
+        max_w = max(1, min(8, cpu, total))
+    else:
+        max_w = max(1, min(workers, total))
 
     print(f"Cubemap generation: {total} panoramas | face_size={fs} | workers={max_w}")
 
     if max_w == 1:
+        face_maps = precompute_face_maps(fs)
         for i, (image_id, path) in enumerate(
             zip(range(1, total + 1), tqdm(images, desc="Cubemap faces", unit="pano"))
         ):
+            if cancel_event is not None and cancel_event.is_set():
+                raise InterruptedError("Cancelled by user")
             process_panorama(image_id, path, output_dir, yaw_px, face_maps, nadir_zenith_dir)
-            if progress_callback:
-                progress_callback((i + 1) / total * 0.88)
+            _emit_progress(progress_callback, (i + 1) / total * 0.85,
+                           f"Rendering cubemap {i + 1}/{total}")
         return fs
 
-    with ProcessPoolExecutor(max_workers=max_w) as ex:
-        futures = [
-            ex.submit(process_panorama, i + 1, p, output_dir, yaw_px, face_maps, nadir_zenith_dir)
+    nz_arg = str(nadir_zenith_dir) if nadir_zenith_dir is not None else None
+    with ProcessPoolExecutor(
+        max_workers=max_w,
+        initializer=_worker_init,
+        initargs=(fs, yaw_px, str(output_dir), nz_arg),
+    ) as ex:
+        futures = {
+            ex.submit(_worker_run, i + 1, str(p)): i
             for i, p in enumerate(images)
-        ]
+        }
         bar = tqdm(total=total, desc="Cubemap faces", unit="pano")
-        for i, f in enumerate(as_completed(futures)):
-            f.result()
-            bar.update(1)
-            if progress_callback:
-                progress_callback((i + 1) / total * 0.88)
-        bar.close()
+        completed = 0
+        try:
+            for fut in as_completed(futures):
+                if cancel_event is not None and cancel_event.is_set():
+                    for f in futures:
+                        f.cancel()
+                    raise InterruptedError("Cancelled by user")
+                fut.result()
+                completed += 1
+                bar.update(1)
+                _emit_progress(progress_callback, completed / total * 0.85,
+                               f"Rendering cubemap {completed}/{total}")
+        finally:
+            bar.close()
     return fs
 
 
-# ── COLMAP text writers ───────────────────────────────────────────────────────
+# ---- COLMAP text writers ---------------------------------------------------
 
 def write_cameras_txt(path: Path, face_size: int) -> None:
     f = face_size / 2.0
@@ -278,7 +371,7 @@ def write_images_txt(
                 image_id += 1
 
 
-# ── point cloud export ────────────────────────────────────────────────────────
+# ---- point cloud export ----------------------------------------------------
 
 def _extract_rgb(points: dict, count: int) -> np.ndarray:
     if {"colorRed", "colorGreen", "colorBlue"}.issubset(points):
@@ -327,16 +420,33 @@ def _write_point_rows(h, start_id: int, xyz: np.ndarray, rgb: np.ndarray) -> int
     return start_id + n
 
 
-def write_points3d_txt(e57_handle, path: Path, max_points: int | None, seed: int) -> None:
+def write_points3d_txt(
+    e57_handle,
+    path: Path,
+    max_points: int | None,
+    seed: int,
+    progress_callback=None,
+    progress_lo: float = 0.92,
+    progress_hi: float = 1.0,
+) -> None:
     tqdm = load_tqdm()
+    total_scans = e57_handle.scan_count
+
+    def _phase_progress(idx_done: int) -> None:
+        if total_scans > 0:
+            frac = progress_lo + (progress_hi - progress_lo) * (idx_done / total_scans)
+            _emit_progress(progress_callback, frac,
+                           f"Writing points cloud ({idx_done}/{total_scans} scans)")
+
     with path.open("w", encoding="utf-8") as h:
         h.write("# 3D point list\n# POINT3D_ID X Y Z R G B ERROR TRACK[]\n")
         pid = 1
 
         if max_points is None:
-            for sid in tqdm(range(e57_handle.scan_count), desc="Exporting points", unit="scan"):
+            for sid in tqdm(range(total_scans), desc="Exporting points", unit="scan"):
                 xyz, rgb = _read_scan_chunk(e57_handle, sid)
                 pid = _write_point_rows(h, pid, xyz, rgb)
+                _phase_progress(sid + 1)
             return
 
         scan_counts = _get_scan_counts(e57_handle)
@@ -344,9 +454,10 @@ def write_points3d_txt(e57_handle, path: Path, max_points: int | None, seed: int
             total = sum(scan_counts)
             sel = _select_indices(total, max_points, seed)
             if sel is None:
-                for sid in tqdm(range(e57_handle.scan_count), desc="Exporting points", unit="scan"):
+                for sid in tqdm(range(total_scans), desc="Exporting points", unit="scan"):
                     xyz, rgb = _read_scan_chunk(e57_handle, sid)
                     pid = _write_point_rows(h, pid, xyz, rgb)
+                    _phase_progress(sid + 1)
                 return
             chunk_start = 0
             for sid, sc in enumerate(tqdm(scan_counts, desc="Exporting sampled points", unit="scan")):
@@ -358,17 +469,18 @@ def write_points3d_txt(e57_handle, path: Path, max_points: int | None, seed: int
                     xyz, rgb = _read_scan_chunk(e57_handle, sid)
                     pid = _write_point_rows(h, pid, xyz[local], rgb[local])
                 chunk_start = chunk_end
+                _phase_progress(sid + 1)
             return
 
         print("Note: loading all points first (scan counts unavailable)")
         chunks, total = [], 0
-        for sid in tqdm(range(e57_handle.scan_count), desc="Loading points", unit="scan"):
+        for sid in tqdm(range(total_scans), desc="Loading points", unit="scan"):
             xyz, rgb = _read_scan_chunk(e57_handle, sid)
             if xyz.shape[0]:
                 chunks.append((xyz, rgb)); total += xyz.shape[0]
         sel = _select_indices(total, max_points, seed)
         chunk_start = 0
-        for xyz, rgb in chunks:
+        for sid, (xyz, rgb) in enumerate(chunks):
             chunk_end = chunk_start + xyz.shape[0]
             s0 = int(np.searchsorted(sel, chunk_start))
             s1 = int(np.searchsorted(sel, chunk_end))
@@ -376,9 +488,10 @@ def write_points3d_txt(e57_handle, path: Path, max_points: int | None, seed: int
             if local.size > 0:
                 pid = _write_point_rows(h, pid, xyz[local], rgb[local])
             chunk_start = chunk_end
+            _phase_progress(sid + 1)
 
 
-# ── top-level entry point ─────────────────────────────────────────────────────
+# ---- top-level entry point -------------------------------------------------
 
 def run_conversion(
     images_dir: Path,
@@ -391,67 +504,104 @@ def run_conversion(
     camera_offset: np.ndarray | None = None,
     seed: int = 0,
     include_nadir_zenith: bool = False,
-    progress_callback=None,  # Optional[Callable[[float], None]] – 0.0 → 1.0
+    progress_callback=None,
+    cancel_event=None,
+    clean_orphan_faces: bool = True,
 ) -> None:
     """Convert a Realsee Galois M2 capture into a COLMAP dataset.
 
-    include_nadir_zenith=True  → 6-face mode (all faces in images.txt)
-    include_nadir_zenith=False → 4-face mode (py/ny go to sibling nadir_and_zenith/)
+    include_nadir_zenith=True  -> 6-face mode (all faces in images.txt)
+    include_nadir_zenith=False -> 4-face mode (py/ny go to sibling nadir_and_zenith/)
     """
     if not points_path.is_file():
         raise FileNotFoundError(f"E57 file not found: {points_path}")
 
     images = list_panoramas(images_dir)
-    pye57 = load_pye57()
-    e57 = pye57.E57(str(points_path))
 
-    if len(images) != e57.scan_count:
-        raise ValueError(
-            f"Panorama count ({len(images)}) does not match E57 scan count ({e57.scan_count}). "
-            "Check that images/ contains exactly one JPEG per scan."
+    with open_e57(points_path) as e57:
+        scan_count = int(e57.scan_count)
+
+        if len(images) != scan_count:
+            raise ValueError(
+                f"Panorama count ({len(images)}) does not match E57 scan count "
+                f"({scan_count}). Check that images/ contains exactly one JPEG per scan."
+            )
+
+        print(f"Loaded {len(images)} panoramas  |  {scan_count} scans in E57")
+
+        colmap_dir.mkdir(parents=True, exist_ok=True)
+        img_out = colmap_dir / "images"
+        img_out.mkdir(parents=True, exist_ok=True)
+
+        nadir_zenith_dir: Path | None = None
+        if not include_nadir_zenith:
+            nadir_zenith_dir = colmap_dir.parent / "nadir_and_zenith"
+            nadir_zenith_dir.mkdir(parents=True, exist_ok=True)
+            print(f"4-face mode  ->  py/ny faces saved to: {nadir_zenith_dir.name}/")
+            if clean_orphan_faces:
+                _purge_orphan_pole_faces(img_out)
+        else:
+            print("6-face mode  ->  all faces included in COLMAP dataset")
+            if clean_orphan_faces:
+                _purge_orphan_pole_faces(colmap_dir.parent / "nadir_and_zenith", remove_dir=True)
+
+        _emit_progress(progress_callback, 0.0, "Starting cubemap render")
+
+        fs = convert_panoramas_to_cubemaps(
+            images, img_out, face_size, yaw_offset_deg, workers, nadir_zenith_dir,
+            progress_callback=progress_callback, cancel_event=cancel_event,
         )
 
-    print(f"Loaded {len(images)} panoramas  |  {e57.scan_count} scans in E57")
+        print("Writing cameras.txt ...")
+        write_cameras_txt(colmap_dir / "cameras.txt", fs)
+        _emit_progress(progress_callback, 0.88, "Writing cameras.txt")
 
-    colmap_dir.mkdir(parents=True, exist_ok=True)
-    img_out = colmap_dir / "images"
-    img_out.mkdir(parents=True, exist_ok=True)
+        print("Writing images.txt ...")
+        write_images_txt(
+            e57,
+            colmap_dir / "images.txt",
+            len(images),
+            yaw_offset_deg,
+            camera_offset if camera_offset is not None else DEFAULT_CAMERA_OFFSET,
+            include_nadir_zenith=include_nadir_zenith,
+        )
+        _emit_progress(progress_callback, 0.92, "Writing points3D.txt")
 
-    nadir_zenith_dir: Path | None = None
-    if not include_nadir_zenith:
-        nadir_zenith_dir = colmap_dir.parent / "nadir_and_zenith"
-        nadir_zenith_dir.mkdir(parents=True, exist_ok=True)
-        print(f"4-face mode  →  py/ny faces saved to: {nadir_zenith_dir.name}/")
-    else:
-        print("6-face mode  →  all faces included in COLMAP dataset")
+        write_points3d_txt(
+            e57, colmap_dir / "points3D.txt", max_points, seed,
+            progress_callback=progress_callback,
+            progress_lo=0.92, progress_hi=1.0,
+        )
+        _emit_progress(progress_callback, 1.0, "Done")
 
-    fs = convert_panoramas_to_cubemaps(
-        images, img_out, face_size, yaw_offset_deg, workers, nadir_zenith_dir,
-        progress_callback=progress_callback,
-    )
-
-    print("Writing cameras.txt …")
-    write_cameras_txt(colmap_dir / "cameras.txt", fs)
-    write_images_txt(
-        e57,
-        colmap_dir / "images.txt",
-        len(images),
-        yaw_offset_deg,
-        camera_offset if camera_offset is not None else DEFAULT_CAMERA_OFFSET,
-        include_nadir_zenith=include_nadir_zenith,
-    )
-    if progress_callback:
-        progress_callback(0.92)
-
-    write_points3d_txt(e57, colmap_dir / "points3D.txt", max_points, seed)
-    if progress_callback:
-        progress_callback(1.0)
-
-    n_faces = len(FACE_ORDER if include_nadir_zenith else HORIZONTAL_FACES)
-    print(f"\nConversion complete — {len(images) * n_faces} cubemap images → {colmap_dir}")
+        n_faces = len(FACE_ORDER if include_nadir_zenith else HORIZONTAL_FACES)
+        print(f"\nConversion complete - {len(images) * n_faces} cubemap images -> {colmap_dir}")
 
 
-# ── overlay helpers ───────────────────────────────────────────────────────────
+def _purge_orphan_pole_faces(target: Path, remove_dir: bool = False) -> None:
+    """Remove leftover _py/_ny face JPEGs from a prior conversion in the
+    opposite mode so Brush doesn't see images without matching images.txt
+    entries. Best-effort - errors are swallowed."""
+    try:
+        if not target.exists():
+            return
+        if remove_dir and target.is_dir():
+            for f in target.iterdir():
+                try: f.unlink()
+                except Exception: pass
+            try: target.rmdir()
+            except Exception: pass
+            return
+        if target.is_dir():
+            for f in target.iterdir():
+                if f.is_file() and re.match(r"^\d+_(py|ny)\.jpg$", f.name, re.IGNORECASE):
+                    try: f.unlink()
+                    except Exception: pass
+    except Exception:
+        pass
+
+
+# ---- overlay helpers -------------------------------------------------------
 
 def get_available_scans(colmap_dir: Path) -> list[int]:
     """Return sorted list of scan indices present in images.txt."""
@@ -469,17 +619,14 @@ def generate_overlay(
     scan_id: int = 0,
     face: str = "pz",
     max_points: int = 6000,
-) -> "Image.Image":  # type: ignore[name-defined]
+):
     """Generate a 3-panel image: cubemap face | LiDAR overlay | LiDAR dots only.
-    Returns a PIL Image for display in the GUI.
-    """
+    Returns a PIL Image for display in the GUI."""
     from PIL import Image as PILImage, ImageDraw
 
     Rotation = load_rotation()
-    pye57 = load_pye57()
     PILImage.MAX_IMAGE_PIXELS = None
 
-    # Camera params
     cams: dict = {}
     for line in (colmap_dir / "cameras.txt").read_text().splitlines():
         if not line or line.startswith("#"):
@@ -490,7 +637,6 @@ def generate_overlay(
     fx, fy, cx, cy = cam["params"]
     W, H = cam["W"], cam["H"]
 
-    # Find the images.txt entry for this scan + face
     target_name = f"{scan_id + 1}_{face}.jpg"
     entry: dict | None = None
     lines = (colmap_dir / "images.txt").read_text().splitlines()
@@ -516,9 +662,8 @@ def generate_overlay(
     R_w2c = Rotation.from_quat([entry["qx"], entry["qy"], entry["qz"], entry["qw"]]).as_matrix()
     t_w2c = np.array([entry["tx"], entry["ty"], entry["tz"]])
 
-    # Read LiDAR for this scan
-    e57 = pye57.E57(str(e57_path))
-    pts = e57.read_scan(scan_id, colors=True, transform=True, ignore_missing_fields=True)
+    with open_e57(e57_path) as e57:
+        pts = e57.read_scan(scan_id, colors=True, transform=True, ignore_missing_fields=True)
     x = pts["cartesianX"]; y = pts["cartesianY"]; z = pts["cartesianZ"]
     r = pts.get("colorRed",   np.full_like(x, 180, dtype=np.uint8))
     g = pts.get("colorGreen", np.full_like(x, 180, dtype=np.uint8))
@@ -537,7 +682,6 @@ def generate_overlay(
         rng = np.random.default_rng(42)
         idx = rng.choice(idx, size=max_points, replace=False)
 
-    # Load the cubemap face image
     face_path = colmap_dir / "images" / target_name
     base = PILImage.open(face_path).convert("RGB")
 
@@ -561,7 +705,6 @@ def generate_overlay(
         draw_ov.ellipse(bbox, fill=col, outline=(255, 220, 0))
         draw_do.ellipse(bbox, fill=col)
 
-    # Compose 3-panel image
     gap = 10
     label_h = 26
     total_w = panel_w * 3 + gap * 2
@@ -582,13 +725,13 @@ def generate_overlay(
         draw.text((x_pos - tw // 2, 5), text, fill=(0, 58, 140))
 
     n_proj = int(valid.sum())
-    caption = f"Scan {scan_id}  ·  face {face}  ·  {n_proj:,} projected points"
+    caption = f"Scan {scan_id}  -  face {face}  -  {n_proj:,} projected points"
     draw.text((8, total_h - 18), caption, fill=(80, 100, 140))
 
     return out
 
 
-# ── alignment validation ──────────────────────────────────────────────────────
+# ---- alignment validation --------------------------------------------------
 
 def validate_conversion(
     colmap_dir: Path,
@@ -596,21 +739,19 @@ def validate_conversion(
     num_scans: int = 11,
     max_points_per_scan: int = 5000,
     seed: int = 42,
+    progress_callback=None,
 ) -> float | None:
     """Re-project LiDAR points through COLMAP poses and report mean colour diff.
-    Expected range for a healthy M2 capture: 5–9.
-    Returns the overall weighted mean diff, or None if validation could not run.
-    """
+    Expected range for a healthy M2 capture: 5-9.
+    Returns the overall weighted mean diff, or None if validation could not run."""
     try:
         from PIL import Image as PILImage
     except ImportError as e:
         raise SystemExit("Missing 'pillow'. Run: pip install pillow") from e
 
     Rotation = load_rotation()
-    pye57 = load_pye57()
     PILImage.MAX_IMAGE_PIXELS = None
 
-    # Parse cameras.txt
     cams: dict = {}
     for line in (colmap_dir / "cameras.txt").read_text().splitlines():
         if not line or line.startswith("#"):
@@ -621,7 +762,6 @@ def validate_conversion(
     fx, fy, cx, cy = cam["params"]
     W, H = cam["W"], cam["H"]
 
-    # Parse images.txt — group entries by scan id
     by_scan: dict = {}
     lines = (colmap_dir / "images.txt").read_text().splitlines()
     i = 0
@@ -644,11 +784,12 @@ def validate_conversion(
             "name": name,
         }
         if i < len(lines):
-            i += 1  # skip blank line
+            i += 1
 
     available = sorted(by_scan)
     if not available:
-        print("No scans found in images.txt"); return
+        print("No scans found in images.txt")
+        return None
 
     if len(available) <= num_scans:
         scan_ids = available
@@ -658,8 +799,7 @@ def validate_conversion(
             for k in range(num_scans)
         ]
 
-    print(f"Validating {len(scan_ids)} of {len(available)} scans …")
-    e57 = pye57.E57(str(e57_path))
+    print(f"Validating {len(scan_ids)} of {len(available)} scans ...")
     rng = np.random.default_rng(seed)
     images_dir = colmap_dir / "images"
 
@@ -667,55 +807,59 @@ def validate_conversion(
     total_pts = 0
     weighted_sum = 0.0
 
-    for sid in scan_ids:
-        if sid not in by_scan:
-            continue
-        pts = e57.read_scan(sid, colors=True, transform=True, ignore_missing_fields=True)
-        x = pts["cartesianX"]; y = pts["cartesianY"]; z = pts["cartesianZ"]
-        r = pts.get("colorRed",   np.full_like(x, 200, dtype=np.uint8))
-        g = pts.get("colorGreen", np.full_like(x, 200, dtype=np.uint8))
-        b = pts.get("colorBlue",  np.full_like(x, 200, dtype=np.uint8))
-        P = np.stack([x, y, z], axis=1).astype(np.float64) @ FLIP_ROT.T
-
-        if P.shape[0] > max_points_per_scan:
-            idx = rng.choice(P.shape[0], size=max_points_per_scan, replace=False)
-            P = P[idx]; r = np.asarray(r)[idx]; g = np.asarray(g)[idx]; b = np.asarray(b)[idx]
-        P_rgb = np.stack([r, g, b], axis=1).astype(np.uint8)
-
-        scan_diffs = []
-        for face, entry in by_scan[sid].items():
-            R = Rotation.from_quat([entry["qx"], entry["qy"], entry["qz"], entry["qw"]]).as_matrix()
-            t = np.array([entry["tx"], entry["ty"], entry["tz"]])
-            P_cam = P @ R.T + t
-            z_c = P_cam[:, 2]
-            ok = z_c > 0.01
-            u = np.where(ok, fx * P_cam[:, 0] / np.where(ok, z_c, 1) + cx, -1.0)
-            v = np.where(ok, fy * P_cam[:, 1] / np.where(ok, z_c, 1) + cy, -1.0)
-            in_bounds = ok & (u >= 0) & (u < W) & (v >= 0) & (v < H)
-            if not in_bounds.any():
+    with open_e57(e57_path) as e57:
+        for idx_scan, sid in enumerate(scan_ids):
+            if sid not in by_scan:
                 continue
-            img_path = images_dir / entry["name"]
-            if not img_path.exists():
-                continue
-            img = np.array(PILImage.open(img_path).convert("RGB"))
-            us = np.clip(u[in_bounds].astype(np.int32), 0, W - 1)
-            vs = np.clip(v[in_bounds].astype(np.int32), 0, H - 1)
-            diff = float(np.abs(img[vs, us].astype(np.int16) - P_rgb[in_bounds].astype(np.int16)).mean())
-            n = int(in_bounds.sum())
-            scan_diffs.append(diff)
-            all_diffs.append(diff)
-            total_pts += n
-            weighted_sum += diff * n
+            _emit_progress(progress_callback,
+                           (idx_scan + 1) / max(1, len(scan_ids)),
+                           f"Validating scan {idx_scan + 1}/{len(scan_ids)}")
+            pts = e57.read_scan(sid, colors=True, transform=True, ignore_missing_fields=True)
+            x = pts["cartesianX"]; y = pts["cartesianY"]; z = pts["cartesianZ"]
+            r = pts.get("colorRed",   np.full_like(x, 200, dtype=np.uint8))
+            g = pts.get("colorGreen", np.full_like(x, 200, dtype=np.uint8))
+            b = pts.get("colorBlue",  np.full_like(x, 200, dtype=np.uint8))
+            P = np.stack([x, y, z], axis=1).astype(np.float64) @ FLIP_ROT.T
 
-        if scan_diffs:
-            print(f"  Scan {sid:4d}:  mean diff = {np.mean(scan_diffs):.2f}  ({len(scan_diffs)} faces)")
+            if P.shape[0] > max_points_per_scan:
+                idx = rng.choice(P.shape[0], size=max_points_per_scan, replace=False)
+                P = P[idx]; r = np.asarray(r)[idx]; g = np.asarray(g)[idx]; b = np.asarray(b)[idx]
+            P_rgb = np.stack([r, g, b], axis=1).astype(np.uint8)
+
+            scan_diffs = []
+            for face, entry in by_scan[sid].items():
+                R = Rotation.from_quat([entry["qx"], entry["qy"], entry["qz"], entry["qw"]]).as_matrix()
+                t = np.array([entry["tx"], entry["ty"], entry["tz"]])
+                P_cam = P @ R.T + t
+                z_c = P_cam[:, 2]
+                ok = z_c > 0.01
+                u = np.where(ok, fx * P_cam[:, 0] / np.where(ok, z_c, 1) + cx, -1.0)
+                v = np.where(ok, fy * P_cam[:, 1] / np.where(ok, z_c, 1) + cy, -1.0)
+                in_bounds = ok & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+                if not in_bounds.any():
+                    continue
+                img_path = images_dir / entry["name"]
+                if not img_path.exists():
+                    continue
+                img = np.array(PILImage.open(img_path).convert("RGB"))
+                us = np.clip(u[in_bounds].astype(np.int32), 0, W - 1)
+                vs = np.clip(v[in_bounds].astype(np.int32), 0, H - 1)
+                diff = float(np.abs(img[vs, us].astype(np.int16) - P_rgb[in_bounds].astype(np.int16)).mean())
+                n = int(in_bounds.sum())
+                scan_diffs.append(diff)
+                all_diffs.append(diff)
+                total_pts += n
+                weighted_sum += diff * n
+
+            if scan_diffs:
+                print(f"  Scan {sid:4d}:  mean diff = {np.mean(scan_diffs):.2f}  ({len(scan_diffs)} faces)")
 
     if all_diffs:
         overall = weighted_sum / total_pts if total_pts else float("nan")
-        status = "GOOD ✓" if overall <= 10 else "HIGH — check inputs"
+        status = "GOOD" if overall <= 10 else "HIGH - check inputs"
         print(f"\n  Overall: mean={np.mean(all_diffs):.2f}  weighted={overall:.2f}  [{status}]")
-        print(f"  Expected range for a healthy M2 capture: 5–9")
+        print(f"  Expected range for a healthy M2 capture: 5-9")
         return overall
-    else:
-        print("No valid projections found — check that Colmap/images/ contains face images.")
-        return None
+
+    print("No valid projections found - check that Colmap/images/ contains face images.")
+    return None

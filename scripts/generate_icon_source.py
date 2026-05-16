@@ -134,18 +134,27 @@ def main() -> None:
     fav.save(ASSETS / "favicon-light-512.png", "PNG", optimize=True)
     print(f"Wrote favicon-light-512.png  (512x512)")
 
-    # ---- Multi-size Windows .ico ----
+    # ---- Multi-size Windows .ico (Final_Icon.png is the agreed app icon) ----
+    # Crop tight to the squircle content before scaling — the source PNG has
+    # ~230px transparent padding on each side (content fills only ~62% of
+    # canvas). Without cropping, the taskbar icon appears tiny and blurry.
     ico_path = ASSETS / "app_icon.ico"
-    sources = [
-        (16,  monogram),
-        (32,  monogram),
-        (48,  monogram),
-        (64,  wordmark),
-        (128, wordmark),
-        (256, wordmark),
-    ]
+    final_icon_path = ASSETS / "Final_Icon.png"
+    if not final_icon_path.exists():
+        raise SystemExit(f"Missing {final_icon_path}")
+    final_icon = Image.open(final_icon_path).convert("RGBA")
+    bbox = final_icon.getbbox()   # tight box of non-transparent pixels
+    if bbox:
+        pad = int((bbox[2] - bbox[0]) * 0.04)   # 4% padding each side
+        x0 = max(0, bbox[0] - pad)
+        y0 = max(0, bbox[1] - pad)
+        x1 = min(final_icon.width,  bbox[2] + pad)
+        y1 = min(final_icon.height, bbox[3] + pad)
+        final_icon = final_icon.crop((x0, y0, x1, y1))
+    sizes = [16, 24, 32, 48, 64, 128, 256]
+    sources = [(s, final_icon) for s in sizes]
     _write_multi_source_ico(ico_path, sources)
-    print(f"Wrote app_icon.ico  ({len(sources)} sizes)")
+    print(f"Wrote app_icon.ico  ({len(sources)} sizes, source: Final_Icon.png, cropped)")
 
 
 def _write_multi_source_ico(out_path: Path,

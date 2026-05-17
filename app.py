@@ -1,6 +1,7 @@
 """See3D E57 Converter - GUI front-end for the Realsee Galois M2 -> COLMAP pipeline."""
 from __future__ import annotations
 
+import contextlib
 import os
 import queue
 import sys
@@ -454,6 +455,9 @@ class CombinedDropZone(ctk.CTkFrame):
     # ---- accessors ----
     def get_e57(self) -> str:    return self.var_e57.get()
     def get_images(self) -> str: return self.var_images.get()
+
+    def set_e57(self, path: str) -> None:    self._set_e57(path)
+    def set_images(self, path: str) -> None: self._set_images(path)
 
 
 # ---- PresetTile ------------------------------------------------------------
@@ -948,7 +952,7 @@ class See3DConverterApp(ctk.CTk):
         if (_img_dir.is_dir()
                 and not self._dropzone.get_images()
                 and any(f.suffix.lower() in _IMG_EXTS for f in _img_dir.iterdir())):
-            self._dropzone._set_images(str(_img_dir))
+            self._dropzone.set_images(str(_img_dir))
         if not self._out_var.get():
             self._set_output(str(root / "Colmap"))
         # Cross-fill the Validate tab so the user doesn't re-enter paths.
@@ -956,10 +960,10 @@ class See3DConverterApp(ctk.CTk):
         # immediately reads "Missing: cameras.txt, images.txt" before the
         # conversion has even been run.
         if not self._val_drop.var_e57.get():
-            self._val_drop._set_e57(path)
+            self._val_drop.set_e57(path)
         colmap_dir = root / "Colmap"
         if colmap_dir.is_dir() and not self._val_drop.var_images.get():
-            self._val_drop._set_images(str(colmap_dir))
+            self._val_drop.set_images(str(colmap_dir))
         self._refresh_summary()
 
     def _on_images_change(self, path: str):
@@ -1187,44 +1191,39 @@ class See3DConverterApp(ctk.CTk):
         import numpy as np
         from converter_core import run_conversion, validate_conversion
         qs = _QS(self._q)
-        old_out, old_err = sys.stdout, sys.stderr
-        sys.stdout = qs
-        sys.stderr = qs
         validation_failed_msg = None
-        try:
-            run_conversion(
-                images_dir=Path(images), points_path=Path(e57),
-                colmap_dir=Path(output), face_size=face_size, yaw_offset_deg=0.0,
-                workers=workers, max_points=max_pts if max_pts > 0 else None,
-                camera_offset=np.zeros(3), seed=seed,
-                include_nadir_zenith=not self.var_4face.get(),
-                progress_callback=cb,
-                cancel_event=self._cancel_event,
-            )
-            if self.var_validate.get() and not self._cancel_event.is_set():
-                print("\n-- Alignment validation -----------------------------")
-                try:
-                    validate_conversion(colmap_dir=Path(output), e57_path=Path(e57))
-                except Exception as v_exc:
-                    import traceback
-                    validation_failed_msg = str(v_exc)
-                    print(f"\nValidation skipped: {v_exc}\n{traceback.format_exc()}")
-            if self._cancel_event.is_set():
+        with contextlib.redirect_stdout(qs), contextlib.redirect_stderr(qs):
+            try:
+                run_conversion(
+                    images_dir=Path(images), points_path=Path(e57),
+                    colmap_dir=Path(output), face_size=face_size, yaw_offset_deg=0.0,
+                    workers=workers, max_points=max_pts if max_pts > 0 else None,
+                    camera_offset=np.zeros(3), seed=seed,
+                    include_nadir_zenith=not self.var_4face.get(),
+                    progress_callback=cb,
+                    cancel_event=self._cancel_event,
+                )
+                if self.var_validate.get() and not self._cancel_event.is_set():
+                    print("\n-- Alignment validation -----------------------------")
+                    try:
+                        validate_conversion(colmap_dir=Path(output), e57_path=Path(e57))
+                    except Exception as v_exc:
+                        import traceback
+                        validation_failed_msg = str(v_exc)
+                        print(f"\nValidation skipped: {v_exc}\n{traceback.format_exc()}")
+                if self._cancel_event.is_set():
+                    self._q.put(("error", "Cancelled by user"))
+                else:
+                    done_msg = "Conversion complete."
+                    if validation_failed_msg:
+                        done_msg += " (validation skipped - see log)"
+                    self._q.put(("done", done_msg))
+            except InterruptedError:
                 self._q.put(("error", "Cancelled by user"))
-            else:
-                done_msg = "Conversion complete."
-                if validation_failed_msg:
-                    done_msg += " (validation skipped - see log)"
-                self._q.put(("done", done_msg))
-        except InterruptedError:
-            self._q.put(("error", "Cancelled by user"))
-        except Exception as exc:
-            import traceback
-            self._q.put(("log", f"\n--- ERROR ---\n{exc}\n{traceback.format_exc()}\n"))
-            self._q.put(("error", str(exc)))
-        finally:
-            sys.stdout = old_out
-            sys.stderr = old_err
+            except Exception as exc:
+                import traceback
+                self._q.put(("log", f"\n--- ERROR ---\n{exc}\n{traceback.format_exc()}\n"))
+                self._q.put(("error", str(exc)))
 
     def _on_done(self, success: bool, message: str):
         self._converting = False
@@ -1279,32 +1278,27 @@ class See3DConverterApp(ctk.CTk):
     def _val_worker(self, colmap: str, e57: str):
         from converter_core import validate_conversion, get_available_scans, generate_overlay
         qs = _QS(self._q)
-        old_out, old_err = sys.stdout, sys.stderr
-        sys.stdout = qs
-        sys.stderr = qs
-        try:
-            score = validate_conversion(Path(colmap), Path(e57))
-            overlays, labels = [], []
+        with contextlib.redirect_stdout(qs), contextlib.redirect_stderr(qs):
             try:
-                scans = get_available_scans(Path(colmap))
-                if scans:
-                    picks = sorted({scans[0], scans[len(scans) // 2], scans[-1]})
-                    for sid in picks:
-                        print(f"Generating overlay for scan {sid}...")
-                        img = generate_overlay(Path(colmap), Path(e57),
-                                               scan_id=sid, face="pz")
-                        overlays.append(img)
-                        labels.append(f"Scan {sid}  -  pz face")
-            except Exception as oe:
-                print(f"Note: overlay generation skipped - {oe}")
-            self._q.put(("val_done", (score, overlays, labels)))
-        except Exception as exc:
-            import traceback
-            self._q.put(("log", f"\nValidation ERROR: {exc}\n{traceback.format_exc()}\n"))
-            self._q.put(("val_done", (None, [], [])))
-        finally:
-            sys.stdout = old_out
-            sys.stderr = old_err
+                score = validate_conversion(Path(colmap), Path(e57))
+                overlays, labels = [], []
+                try:
+                    scans = get_available_scans(Path(colmap))
+                    if scans:
+                        picks = sorted({scans[0], scans[len(scans) // 2], scans[-1]})
+                        for sid in picks:
+                            print(f"Generating overlay for scan {sid}...")
+                            img = generate_overlay(Path(colmap), Path(e57),
+                                                   scan_id=sid, face="pz")
+                            overlays.append(img)
+                            labels.append(f"Scan {sid}  -  pz face")
+                except Exception as oe:
+                    print(f"Note: overlay generation skipped - {oe}")
+                self._q.put(("val_done", (score, overlays, labels)))
+            except Exception as exc:
+                import traceback
+                self._q.put(("log", f"\nValidation ERROR: {exc}\n{traceback.format_exc()}\n"))
+                self._q.put(("val_done", (None, [], [])))
 
     def _on_val_done(self, payload):
         score, overlays, labels = payload

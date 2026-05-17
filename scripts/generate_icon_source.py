@@ -23,7 +23,7 @@ Design:
 from __future__ import annotations
 from pathlib import Path
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 HERE   = Path(__file__).resolve().parent.parent
 ASSETS = HERE / "assets"
@@ -109,6 +109,15 @@ def build_monogram_image(src: Image.Image) -> Image.Image:
     return canvas
 
 
+def _magick_available() -> bool:
+    import subprocess as _sp
+    try:
+        _sp.run(["magick", "--version"], capture_output=True, check=True, timeout=5)
+        return True
+    except Exception:
+        return False
+
+
 def main() -> None:
     src_path = ASSETS / "See3D Vector.png"
     if not src_path.exists():
@@ -134,27 +143,75 @@ def main() -> None:
     fav.save(ASSETS / "favicon-light-512.png", "PNG", optimize=True)
     print(f"Wrote favicon-light-512.png  (512x512)")
 
-    # ---- Multi-size Windows .ico (Final_Icon.png is the agreed app icon) ----
-    # Crop tight to the squircle content before scaling — the source PNG has
-    # ~230px transparent padding on each side (content fills only ~62% of
-    # canvas). Without cropping, the taskbar icon appears tiny and blurry.
-    ico_path = ASSETS / "app_icon.ico"
-    final_icon_path = ASSETS / "Final_Icon.png"
-    if not final_icon_path.exists():
-        raise SystemExit(f"Missing {final_icon_path}")
-    final_icon = Image.open(final_icon_path).convert("RGBA")
-    bbox = final_icon.getbbox()   # tight box of non-transparent pixels
-    if bbox:
-        pad = int((bbox[2] - bbox[0]) * 0.04)   # 4% padding each side
-        x0 = max(0, bbox[0] - pad)
-        y0 = max(0, bbox[1] - pad)
-        x1 = min(final_icon.width,  bbox[2] + pad)
-        y1 = min(final_icon.height, bbox[3] + pad)
-        final_icon = final_icon.crop((x0, y0, x1, y1))
-    sizes = [16, 24, 32, 48, 64, 128, 256]
-    sources = [(s, final_icon) for s in sizes]
+    # ---- Multi-size Windows .ico ----
+    # Hybrid strategy:
+    #   Small (≤48px) — simplified wordmark on solid white, fills the square
+    #                   well and stays legible on the taskbar.
+    #   Large (≥64px) — full Final_Icon squircle design (SVG via ImageMagick,
+    #                   or Final_Icon.png crop as fallback) for Explorer,
+    #                   Start menu, Alt-Tab, and large-icon views.
+    # Windows automatically picks the closest size from the ICO container,
+    # so each context gets the right artwork without any code changes in app.py.
+    ico_path  = ASSETS / "app_icon.ico"
+    svg_path  = ASSETS / "Final_Icon.svg"
+    png_path  = ASSETS / "Final_Icon.png"
+    vec_path  = ASSETS / "See3D Vector.png"
+    sizes     = [16, 24, 32, 48, 64, 128, 256]
+    SMALL     = {16, 24, 32, 48}
+
+    # --- Build wordmark frames for small sizes ---
+    if not vec_path.exists():
+        raise SystemExit(f"Missing {vec_path}")
+    wm = Image.open(vec_path).convert("RGBA")
+    wm = wm.crop(wm.getbbox())
+    p  = max(2, int(wm.width * 0.02))
+    wm = Image.fromarray(
+        np.pad(np.array(wm), ((p, p), (p, p), (0, 0)), constant_values=0),
+        mode="RGBA",
+    )
+
+    def _wordmark_frame(size: int) -> Image.Image:
+        canvas  = Image.new("RGBA", (size, size), (255, 255, 255, 255))
+        avail_w = int(size * 0.80)
+        logo_h  = max(1, int(wm.height * (avail_w / wm.width)))
+        logo    = wm.resize((avail_w, logo_h), Image.LANCZOS)
+        bg      = Image.new("RGBA", (avail_w, logo_h), (255, 255, 255, 255))
+        bg.alpha_composite(logo)
+        canvas.alpha_composite(bg, ((size - avail_w) // 2, (size - logo_h) // 2))
+        return canvas
+
+    # --- Build full-icon frames for large sizes ---
+    import subprocess as _sp
+    from io import BytesIO as _BytesIO
+
+    def _large_frame(size: int) -> Image.Image:
+        if svg_path.exists() and _magick_available():
+            result = _sp.run(
+                ["magick", "-background", "none",
+                 str(svg_path), "-resize", f"{size}x{size}", "PNG:-"],
+                capture_output=True, check=True,
+            )
+            return Image.open(_BytesIO(result.stdout)).convert("RGBA")
+        if not png_path.exists():
+            raise SystemExit(f"Missing {png_path}")
+        img  = Image.open(png_path).convert("RGBA")
+        bbox = img.getbbox()
+        if bbox:
+            pad = int((bbox[2] - bbox[0]) * 0.04)
+            img = img.crop((
+                max(0, bbox[0] - pad), max(0, bbox[1] - pad),
+                min(img.width,  bbox[2] + pad),
+                min(img.height, bbox[3] + pad),
+            ))
+        return img
+
+    sources = [
+        (s, _wordmark_frame(s) if s in SMALL else _large_frame(s))
+        for s in sizes
+    ]
+    method = "SVG+wordmark" if (svg_path.exists() and _magick_available()) else "PNG+wordmark"
     _write_multi_source_ico(ico_path, sources)
-    print(f"Wrote app_icon.ico  ({len(sources)} sizes, source: Final_Icon.png, cropped)")
+    print(f"Wrote app_icon.ico  ({len(sizes)} sizes, {method})")
 
 
 def _write_multi_source_ico(out_path: Path,

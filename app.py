@@ -943,8 +943,12 @@ class See3DConverterApp(ctk.CTk):
     def _on_e57_change(self, path: str):
         parent = Path(path).parent
         root = parent.parent if parent.name.lower() == "points" else parent
-        if (root / "images").is_dir() and not self._dropzone.get_images():
-            self._dropzone._set_images(str(root / "images"))
+        _IMG_EXTS = {".jpg", ".jpeg", ".png"}
+        _img_dir = root / "images"
+        if (_img_dir.is_dir()
+                and not self._dropzone.get_images()
+                and any(f.suffix.lower() in _IMG_EXTS for f in _img_dir.iterdir())):
+            self._dropzone._set_images(str(_img_dir))
         if not self._out_var.get():
             self._set_output(str(root / "Colmap"))
         # Cross-fill the Validate tab so the user doesn't re-enter paths.

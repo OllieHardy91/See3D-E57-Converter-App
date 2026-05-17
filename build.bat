@@ -66,6 +66,7 @@ echo [4/4] Building .exe with PyInstaller (onefile, no UPX)...
   --collect-data cv2 ^
   --collect-binaries cv2 ^
   --collect-binaries pye57 ^
+  --collect-binaries tkinterdnd2 ^
   --exclude-module torch ^
   --exclude-module torchvision ^
   --exclude-module torchaudio ^

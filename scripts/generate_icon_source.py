@@ -144,46 +144,74 @@ def main() -> None:
     print(f"Wrote favicon-light-512.png  (512x512)")
 
     # ---- Multi-size Windows .ico ----
-    # Prefer SVG + ImageMagick: renders each size from vector geometry so edges
-    # are mathematically sharp at every resolution (especially the taskbar sizes).
-    # Falls back to PIL + PNG crop if magick is not on PATH or SVG is missing.
-    ico_path   = ASSETS / "app_icon.ico"
-    svg_path   = ASSETS / "Final_Icon.svg"
-    png_path   = ASSETS / "Final_Icon.png"
-    sizes      = [16, 24, 32, 48, 64, 128, 256]
+    # Hybrid strategy:
+    #   Small (≤48px) — simplified wordmark on solid white, fills the square
+    #                   well and stays legible on the taskbar.
+    #   Large (≥64px) — full Final_Icon squircle design (SVG via ImageMagick,
+    #                   or Final_Icon.png crop as fallback) for Explorer,
+    #                   Start menu, Alt-Tab, and large-icon views.
+    # Windows automatically picks the closest size from the ICO container,
+    # so each context gets the right artwork without any code changes in app.py.
+    ico_path  = ASSETS / "app_icon.ico"
+    svg_path  = ASSETS / "Final_Icon.svg"
+    png_path  = ASSETS / "Final_Icon.png"
+    vec_path  = ASSETS / "See3D Vector.png"
+    sizes     = [16, 24, 32, 48, 64, 128, 256]
+    SMALL     = {16, 24, 32, 48}
 
-    if svg_path.exists() and _magick_available():
-        print("  ICO: rendering from SVG via ImageMagick (vector-sharp)")
-        import subprocess as _sp
-        from io import BytesIO as _BytesIO
-        sources = []
-        for size in sizes:
+    # --- Build wordmark frames for small sizes ---
+    if not vec_path.exists():
+        raise SystemExit(f"Missing {vec_path}")
+    wm = Image.open(vec_path).convert("RGBA")
+    wm = wm.crop(wm.getbbox())
+    p  = max(2, int(wm.width * 0.02))
+    wm = Image.fromarray(
+        np.pad(np.array(wm), ((p, p), (p, p), (0, 0)), constant_values=0),
+        mode="RGBA",
+    )
+
+    def _wordmark_frame(size: int) -> Image.Image:
+        canvas  = Image.new("RGBA", (size, size), (255, 255, 255, 255))
+        avail_w = int(size * 0.80)
+        logo_h  = max(1, int(wm.height * (avail_w / wm.width)))
+        logo    = wm.resize((avail_w, logo_h), Image.LANCZOS)
+        bg      = Image.new("RGBA", (avail_w, logo_h), (255, 255, 255, 255))
+        bg.alpha_composite(logo)
+        canvas.alpha_composite(bg, ((size - avail_w) // 2, (size - logo_h) // 2))
+        return canvas
+
+    # --- Build full-icon frames for large sizes ---
+    import subprocess as _sp
+    from io import BytesIO as _BytesIO
+
+    def _large_frame(size: int) -> Image.Image:
+        if svg_path.exists() and _magick_available():
             result = _sp.run(
                 ["magick", "-background", "none",
-                 str(svg_path), "-resize", f"{size}x{size}",
-                 "PNG:-"],
+                 str(svg_path), "-resize", f"{size}x{size}", "PNG:-"],
                 capture_output=True, check=True,
             )
-            img = Image.open(_BytesIO(result.stdout)).convert("RGBA")
-            sources.append((size, img))
-        _write_multi_source_ico(ico_path, sources)
-        print(f"Wrote app_icon.ico  ({len(sizes)} sizes, SVG source)")
-    else:
-        print("  ICO: falling back to PNG (install ImageMagick for sharper icons)")
+            return Image.open(_BytesIO(result.stdout)).convert("RGBA")
         if not png_path.exists():
             raise SystemExit(f"Missing {png_path}")
-        final_icon = Image.open(png_path).convert("RGBA")
-        bbox = final_icon.getbbox()
+        img  = Image.open(png_path).convert("RGBA")
+        bbox = img.getbbox()
         if bbox:
             pad = int((bbox[2] - bbox[0]) * 0.04)
-            final_icon = final_icon.crop((
+            img = img.crop((
                 max(0, bbox[0] - pad), max(0, bbox[1] - pad),
-                min(final_icon.width,  bbox[2] + pad),
-                min(final_icon.height, bbox[3] + pad),
+                min(img.width,  bbox[2] + pad),
+                min(img.height, bbox[3] + pad),
             ))
-        sources = [(s, final_icon) for s in sizes]
-        _write_multi_source_ico(ico_path, sources)
-        print(f"Wrote app_icon.ico  ({len(sizes)} sizes, PNG source)")
+        return img
+
+    sources = [
+        (s, _wordmark_frame(s) if s in SMALL else _large_frame(s))
+        for s in sizes
+    ]
+    method = "SVG+wordmark" if (svg_path.exists() and _magick_available()) else "PNG+wordmark"
+    _write_multi_source_ico(ico_path, sources)
+    print(f"Wrote app_icon.ico  ({len(sizes)} sizes, {method})")
 
 
 def _write_multi_source_ico(out_path: Path,
@@ -198,8 +226,6 @@ def _write_multi_source_ico(out_path: Path,
     pngs: list[tuple[int, bytes]] = []
     for size, src in entries:
         im = src.resize((size, size), Image.LANCZOS).convert("RGBA")
-        if size <= 48:
-            im = im.filter(ImageFilter.UnsharpMask(radius=0.6, percent=180, threshold=2))
         buf = BytesIO()
         im.save(buf, format="PNG", optimize=True)
         pngs.append((size, buf.getvalue()))

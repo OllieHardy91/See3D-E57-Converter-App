@@ -74,13 +74,6 @@ jobs:
             --exclude-module notebook `
             app.py
 
-      - name: Upload artifact
-        if: "!startsWith(github.ref, 'refs/tags/v')"
-        uses: actions/upload-artifact@v4
-        with:
-          name: See3D_E57_Converter-windows
-          path: dist/See3D_E57_Converter.exe
-
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
@@ -159,13 +152,6 @@ jobs:
       - name: Zip .app for upload
         working-directory: dist
         run: zip -r See3D_E57_Converter-mac.zip See3D_E57_Converter.app
-
-      - name: Upload artifact
-        if: "!startsWith(github.ref, 'refs/tags/v')"
-        uses: actions/upload-artifact@v4
-        with:
-          name: See3D_E57_Converter-macos
-          path: dist/See3D_E57_Converter-mac.zip
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')

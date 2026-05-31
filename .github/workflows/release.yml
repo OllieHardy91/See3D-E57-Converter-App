@@ -76,6 +76,7 @@ jobs:
             app.py
 
       - name: Upload artifact
+        if: "!startsWith(github.ref, 'refs/tags/v')"
         uses: actions/upload-artifact@v4
         with:
           name: See3D_E57_Converter-windows
@@ -162,6 +163,7 @@ jobs:
         run: zip -r See3D_E57_Converter-mac.zip See3D_E57_Converter.app
 
       - name: Upload artifact
+        if: "!startsWith(github.ref, 'refs/tags/v')"
         uses: actions/upload-artifact@v4
         with:
           name: See3D_E57_Converter-macos

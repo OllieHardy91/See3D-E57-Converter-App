@@ -44,10 +44,12 @@ if errorlevel 1 ( echo WARNING: icon conversion failed, building without icon )
 
 echo.
 echo [4/4] Building .exe with PyInstaller (onefile, no UPX)...
+for /f "usebackq delims=" %%P in (`%PY% -c "import tkinterdnd2,os;print(os.path.join(os.path.dirname(tkinterdnd2.__file__),'tkdnd'))"`) do set TKDND=%%P
 %PY% -m PyInstaller --onefile --windowed --noconfirm --noupx ^
   --name "See3D_E57_Converter" ^
   --icon "assets\app_icon.ico" ^
   --add-data "assets;assets" ^
+  --add-data "%TKDND%;tkinterdnd2/tkdnd" ^
   --hidden-import numpy ^
   --hidden-import scipy ^
   --hidden-import scipy.spatial ^
@@ -62,11 +64,9 @@ echo [4/4] Building .exe with PyInstaller (onefile, no UPX)...
   --hidden-import customtkinter ^
   --hidden-import tkinterdnd2 ^
   --collect-data customtkinter ^
-  --collect-data tkinterdnd2 ^
   --collect-data cv2 ^
   --collect-binaries cv2 ^
   --collect-binaries pye57 ^
-  --collect-binaries tkinterdnd2 ^
   --exclude-module torch ^
   --exclude-module torchvision ^
   --exclude-module torchaudio ^

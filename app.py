@@ -844,7 +844,15 @@ class See3DConverterApp(ctk.CTk):
         self._has_dnd = False
         if HAS_DND and _tkdnd:
             try:
-                _tkdnd.TkinterDnD._require(self)
+                if hasattr(sys, "_MEIPASS"):
+                    # PyInstaller bundle: --add-data places tkdnd here.
+                    # Pass the path explicitly so _require doesn't rely on
+                    # __file__ which can resolve incorrectly in onefile mode.
+                    _tkdnd.TkinterDnD._require(
+                        self,
+                        str(Path(sys._MEIPASS) / "tkinterdnd2" / "tkdnd"))
+                else:
+                    _tkdnd.TkinterDnD._require(self)
                 self._has_dnd = True
             except Exception:
                 pass

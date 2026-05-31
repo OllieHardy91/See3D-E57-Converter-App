@@ -57,8 +57,7 @@ jobs:
             --hidden-import customtkinter `
             --hidden-import tkinterdnd2 `
             --collect-data customtkinter `
-            --collect-data tkinterdnd2 `
-            --collect-binaries tkinterdnd2 `
+            --collect-all tkinterdnd2 `
             --collect-data cv2 `
             --collect-binaries cv2 `
             --collect-binaries pye57 `
@@ -140,8 +139,7 @@ jobs:
             --hidden-import customtkinter \
             --hidden-import tkinterdnd2 \
             --collect-data customtkinter \
-            --collect-data tkinterdnd2 \
-            --collect-binaries tkinterdnd2 \
+            --collect-all tkinterdnd2 \
             --collect-data cv2 \
             --collect-binaries cv2 \
             --collect-binaries pye57 \

@@ -1,6 +1,8 @@
 """See3D E57 Converter - GUI front-end for the Realsee Galois M2 -> COLMAP pipeline."""
 from __future__ import annotations
 
+import contextlib
+import math
 import os
 import queue
 import sys
@@ -10,7 +12,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
-from PIL import Image
+from PIL import Image, ImageTk
 
 try:
     import tkinterdnd2 as _tkdnd
@@ -23,8 +25,23 @@ except ImportError:
 
 try:
     from converter_core import __version__ as CORE_VERSION
+    from converter_core import (
+        run_conversion, validate_conversion, count_panoramas,
+        get_e57_scan_count, get_available_scans, generate_overlay,
+    )
 except Exception:
     CORE_VERSION = "0.0.0"
+    run_conversion = validate_conversion = count_panoramas = None          # type: ignore[assignment]
+    get_e57_scan_count = get_available_scans = generate_overlay = None     # type: ignore[assignment]
+
+
+def _safe_schedule(widget: tk.Misc, ms: int, fn) -> None:
+    """Schedule fn on widget's event loop if the widget still exists."""
+    try:
+        if widget.winfo_exists():
+            widget.after(ms, fn)
+    except tk.TclError:
+        pass
 
 APP_VERSION = CORE_VERSION
 
@@ -375,14 +392,9 @@ class CombinedDropZone(ctk.CTkFrame):
         threading.Thread(target=self._detect_images, args=(path,), daemon=True).start()
 
     def _safe_update(self, fn):
-        try:
-            if self.winfo_exists():
-                self.after(0, fn)
-        except tk.TclError:
-            pass
+        _safe_schedule(self, 0, fn)
 
     def _detect_e57(self, path):
-        from converter_core import get_e57_scan_count
         try:
             mb = os.path.getsize(path) / 1e6
             sz = f"{mb/1000:.1f} GB" if mb >= 1000 else f"{mb:.0f} MB"
@@ -415,8 +427,12 @@ class CombinedDropZone(ctk.CTkFrame):
                 return
             n = sum(1 for f in Path(path).iterdir()
                     if f.suffix.lower() in (".jpg", ".jpeg", ".png"))
-            self._safe_update(lambda i=n: meta.configure(
-                text=f"{i} panorama images  OK", text_color=C_SUCCESS))
+            if n == 0:
+                self._safe_update(lambda: meta.configure(
+                    text="0 panorama images — check folder", text_color=C_WARN))
+            else:
+                self._safe_update(lambda i=n: meta.configure(
+                    text=f"{i} panorama images  OK", text_color=C_SUCCESS))
         except Exception:
             self._safe_update(lambda: meta.configure(text="Loaded OK", text_color=C_SUCCESS))
 
@@ -454,6 +470,9 @@ class CombinedDropZone(ctk.CTkFrame):
     # ---- accessors ----
     def get_e57(self) -> str:    return self.var_e57.get()
     def get_images(self) -> str: return self.var_images.get()
+
+    def set_e57(self, path: str) -> None:    self._set_e57(path)
+    def set_images(self, path: str) -> None: self._set_images(path)
 
 
 # ---- PresetTile ------------------------------------------------------------
@@ -493,6 +512,289 @@ class PresetTile(ctk.CTkFrame):
             self._chk.place_forget()
 
 
+# ---- ConvertingVideo -------------------------------------------------------
+class ConvertingVideo(ctk.CTkFrame):
+    """Looping point-cloud video viewport, shown while a conversion runs.
+
+    Locked to the source asset's native pixel size (default 800x300) so
+    widening the parent column adds horizontal margin rather than
+    upscaling the frames -- upscaling makes the wave look pixelated and
+    dominate the layout. Progress isn't indicated here; the CONVERT
+    button text + phase label below the viewport carry that.
+
+    Frames are pre-rasterised to PhotoImage once at construction; the
+    animation loop is just a Canvas itemconfig swap at ~15 fps.
+    """
+
+    _FRAME_MS = 33  # ~30 fps to match the source decimation
+
+    def __init__(self, master, *, anim_rel: str,
+                 nominal_w: int = 800, nominal_h: int = 300, **kw):
+        # Let the Canvas's explicit pixel size drive the frame's natural
+        # size -- passing width/height to CTkFrame applies DPI scaling
+        # which then mismatches tk.Canvas's raw pixel sizing.
+        # Border is C_ACCENT2 / 2 px so the viewport reads as an intentional
+        # "section card" rather than dissolving into the page.
+        super().__init__(master, fg_color=C_CARD,
+                         border_color=C_BORDER, border_width=1,
+                         corner_radius=8, **kw)
+
+        self._idx = 0
+        self._anim_id: str | None = None
+        # PIL Images loaded once; PhotoImages rasterised lazily in start()
+        # so the ~322 MB allocation only happens when a conversion actually runs.
+        self._src_frames = self._load_frames(anim_rel)
+        self._photos: list[ImageTk.PhotoImage] = []
+
+        # Use _vc (not _canvas) to avoid shadowing CTkBaseClass's own
+        # self._canvas, which handles border/corner-radius drawing.
+        self._vc = tk.Canvas(self, highlightthickness=0, bd=0,
+                             bg=C_CARD, width=nominal_w, height=nominal_h)
+        self._vc.grid(row=0, column=0, padx=4, pady=4)
+        self._img_item = self._vc.create_image(0, 0, anchor="nw")
+
+    @staticmethod
+    def _load_frames(anim_rel: str) -> list[Image.Image]:
+        path = resource_path(anim_rel)
+        if not path.exists():
+            return []
+        try:
+            src = Image.open(path)
+        except Exception:
+            return []
+        frames: list[Image.Image] = []
+        i = 0
+        try:
+            while True:
+                src.seek(i)
+                frames.append(src.copy().convert("RGB"))
+                i += 1
+        except EOFError:
+            pass
+        return frames
+
+    # ---- public API ---------------------------------------------------------
+    def start(self) -> None:
+        if self._anim_id is not None:
+            return
+        if not self._photos:
+            if not self._src_frames:
+                return
+            # Rasterise frames on first start() — deferred from __init__ so
+            # the ~322 MB footprint only appears while a conversion is running.
+            self._photos = [ImageTk.PhotoImage(f) for f in self._src_frames]
+        self._tick()
+
+    def stop(self) -> None:
+        if self._anim_id is not None:
+            try:
+                self.after_cancel(self._anim_id)
+            except Exception:
+                pass
+            self._anim_id = None
+
+    def _tick(self) -> None:
+        if self._photos:
+            self._idx = (self._idx + 1) % len(self._photos)
+            self._vc.itemconfig(self._img_item, image=self._photos[self._idx])
+        self._anim_id = self.after(self._FRAME_MS, self._tick)
+
+
+# ---- ShimmerProgressBanner -------------------------------------------------
+class ShimmerProgressBanner(tk.Canvas):
+    """Drop-in replacement for the CONVERT button shown during conversion.
+
+    Looks like the navy CONVERT button at rest, but the background fills
+    cyan from left to right as progress advances. A brighter band
+    continuously sweeps across the *filled* portion of the bar, reading
+    as a "shimmer" effect -- closest tkinter analogue to the
+    CSS background-clip:text shimmer the user referenced (text-shimmer
+    on 21st.dev). Text "Converting... NN%" is overlaid centred.
+
+    Public API:
+      .set_progress(frac)  -- 0..1, advances the cyan fill width
+      .set_text(s)         -- updates the centred label
+      .start() / .stop()   -- shimmer animation loop
+    """
+
+    _TICK_MS = 40          # 25 fps shimmer sweep
+    _CYCLE_PER_SEC = 0.8   # full sweeps per second (slower = calmer)
+    _BAND_FRAC = 0.18      # shimmer band width as fraction of widget width
+    _RADIUS = 8
+
+    def __init__(self, parent, *, height: int = 46, **kw):
+        # bg=C_BG matches the app background so the four corners of the
+        # rounded-rect geometry (which are canvas-background coloured) blend
+        # into the surrounding panel rather than showing a dark square.
+        super().__init__(parent, height=height, bg=C_BG,
+                         highlightthickness=0, bd=0, **kw)
+        self._frac = 0.0
+        self._text = "Converting... 0%"
+        self._shimmer_t = 0.0
+        self._shimmer_disabled = False
+        self._anim_id: str | None = None
+        self._font = _f(14, "bold")
+        self._cw = self._ch = 0   # cached canvas dimensions from last Configure event
+        # Deferred redraw: the layout hasn't fully settled when <Configure>
+        # fires (especially on multi-monitor DPI changes), so winfo_width()
+        # can return a stale value if called immediately.
+        self.bind("<Configure>", lambda e: self.after(5, self._redraw))
+
+    # ---- public API ---------------------------------------------------------
+    def set_progress(self, frac: float) -> None:
+        self._frac = max(0.0, min(1.0, float(frac)))
+        self._draw_fg(self._cw, self._ch)
+
+    def set_text(self, text: str) -> None:
+        self._text = text
+        self._draw_fg(self._cw, self._ch)
+
+    def nudge_to_converting(self) -> None:
+        """Switch 'Starting...' placeholder to 'Converting... 0%' only if no
+        real progress callback has arrived yet (frac still at 0)."""
+        if self._frac == 0.0 and not self._shimmer_disabled:
+            self.set_text("Converting... 0%")
+
+    def set_success(self, text: str = "Done") -> None:
+        """Show 100 %-filled cyan + still text (no shimmer) for the linger
+        moment between conversion-finished and the swap back to CTkButton."""
+        self.stop()
+        self._frac = 1.0
+        self._text = text
+        self._shimmer_disabled = True
+        self._draw_fg(self._cw, self._ch)
+
+    def start(self) -> None:
+        self._shimmer_disabled = False
+        if self._anim_id is None:
+            self._tick()
+
+    def stop(self) -> None:
+        if self._anim_id is not None:
+            try:
+                self.after_cancel(self._anim_id)
+            except Exception:
+                pass
+            self._anim_id = None
+
+    # ---- internals ----------------------------------------------------------
+    def _tick(self) -> None:
+        # Advance shimmer; cycle to slightly past 1.0 so the band exits the
+        # right edge fully before wrapping (no abrupt jump).
+        step = self._CYCLE_PER_SEC * (self._TICK_MS / 1000.0)
+        self._shimmer_t = (self._shimmer_t + step) % (1.0 + self._BAND_FRAC)
+        self._draw_fg(self._cw, self._ch)
+        self._anim_id = self.after(self._TICK_MS, self._tick)
+
+    def _rrect(self, x1, y1, x2, y2, r, fill):
+        """Rounded rectangle approximated with 4 corner ovals + 2 rects."""
+        if x2 - x1 < 2 * r or y2 - y1 < 2 * r:
+            self.create_rectangle(x1, y1, x2, y2, fill=fill, outline="")
+            return
+        self.create_oval(x1, y1, x1 + 2 * r, y1 + 2 * r, fill=fill, outline="")
+        self.create_oval(x2 - 2 * r, y1, x2, y1 + 2 * r, fill=fill, outline="")
+        self.create_oval(x1, y2 - 2 * r, x1 + 2 * r, y2, fill=fill, outline="")
+        self.create_oval(x2 - 2 * r, y2 - 2 * r, x2, y2, fill=fill, outline="")
+        self.create_rectangle(x1 + r, y1, x2 - r, y2, fill=fill, outline="")
+        self.create_rectangle(x1, y1 + r, x2, y2 - r, fill=fill, outline="")
+
+    def _rrect_left(self, x1, y1, x2, y2, r, fill):
+        """Rounded left corners + sharp right edge -- used by the cyan fill."""
+        if x2 - x1 < r:
+            self.create_rectangle(x1, y1, x2, y2, fill=fill, outline="")
+            return
+        if y2 - y1 < 2 * r:
+            self.create_rectangle(x1, y1, x2, y2, fill=fill, outline="")
+            return
+        self.create_oval(x1, y1, x1 + 2 * r, y1 + 2 * r, fill=fill, outline="")
+        self.create_oval(x1, y2 - 2 * r, x1 + 2 * r, y2, fill=fill, outline="")
+        self.create_rectangle(x1 + r, y1, x2, y2, fill=fill, outline="")
+        self.create_rectangle(x1, y1 + r, x1 + r, y2 - r, fill=fill, outline="")
+
+    @staticmethod
+    def _mix(base_hex: str, target_hex: str, t: float) -> str:
+        """Linear blend two #RRGGBB colours, t in 0..1."""
+        b = (int(base_hex[1:3], 16), int(base_hex[3:5], 16), int(base_hex[5:7], 16))
+        tgt = (int(target_hex[1:3], 16), int(target_hex[3:5], 16),
+               int(target_hex[5:7], 16))
+        out = tuple(int(b[i] + (tgt[i] - b[i]) * t) for i in range(3))
+        return f"#{out[0]:02x}{out[1]:02x}{out[2]:02x}"
+
+    def _draw_shimmer(self, x_start: int, band_w: int, h: int, max_x: int):
+        """Vertical lines forming a soft-edged bright band, clipped to max_x.
+
+        Cosine-squared falloff (vs the old triangular falloff) hides the
+        band edges; the peak only whitens the cyan by ~25 % so brand
+        colour stays recognisable and the white text contrast holds.
+        """
+        if band_w <= 1 or self._shimmer_disabled:
+            return
+        center = band_w / 2.0
+        for i in range(band_w):
+            xi = x_start + i
+            if xi < 0 or xi >= max_x:
+                continue
+            d = min(1.0, abs(i - center) / center) if center > 0 else 1.0
+            # cos^2 profile: 1 at centre, 0 at edges, smooth derivative.
+            b = math.cos(d * math.pi / 2.0) ** 2
+            colour = self._mix(C_ACCENT, "#FFFFFF", 0.25 * b)
+            self.create_line(xi, 0, xi, h, fill=colour)
+
+    def _redraw(self):
+        """Full redraw — called on Configure (resize / DPI change).
+
+        Draws the static navy track tagged '_bg', then calls _draw_fg for
+        the dynamic fill/shimmer/text.  Caches canvas dimensions so _tick
+        can call _draw_fg without an extra winfo query per frame.
+        """
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w <= 1 or h <= 1:
+            self._cw = self._ch = 0
+            return
+        self._cw, self._ch = w, h
+        # Navy track is static — draw it once and tag so _draw_fg can
+        # leave it in place and only replace the dynamic layer.
+        self._rrect(0, 0, w, h, self._RADIUS, C_NAVY)
+        for item in self.find_all():
+            self.addtag_withtag("_bg", item)
+        self._draw_fg(w, h)
+
+    def _draw_fg(self, w: int, h: int) -> None:
+        """Redraw only the fill, shimmer and text over the static navy bg.
+
+        Called every tick (~25 fps) so avoids touching the '_bg' items.
+        Also called directly from set_progress / set_text / set_success
+        for instant state-change redraws without touching the track.
+        """
+        if w <= 1 or h <= 1:
+            return
+        self.delete("_fg")
+        # Fill (cyan) -- 0..frac*w, rounded-left only
+        fill_w = int(self._frac * w)
+        if fill_w > 0:
+            self._rrect_left(0, 0, fill_w, h, self._RADIUS, C_ACCENT)
+            if not self._shimmer_disabled:
+                # Shimmer band at current phase AND one cycle behind so the
+                # band wraps smoothly with no visible gap.
+                band_w = max(40, int(self._BAND_FRAC * w))
+                cycle_w = w + band_w
+                x = int(self._shimmer_t * cycle_w) - band_w
+                self._draw_shimmer(x, band_w, h, fill_w)
+                self._draw_shimmer(x - cycle_w, band_w, h, fill_w)
+        # Text: 1 px navy shadow + white overlay for legibility over shimmer.
+        cx, cy = w // 2, h // 2
+        self.create_text(cx + 1, cy + 1, text=self._text, fill=C_NAVY,
+                         font=self._font)
+        self.create_text(cx, cy, text=self._text, fill="white",
+                         font=self._font)
+        # Tag all newly drawn items as '_fg' so the next tick can delete
+        # only them, leaving the '_bg' navy track untouched.
+        self.addtag_withtag("_fg", "all")
+        self.dtag("_bg", "_fg")   # remove '_fg' from the bg items
+
+
 # ---- QueueStream -----------------------------------------------------------
 class _QS:
     """Stdout/stderr redirect that filters tqdm in-place updates (lines with \\r
@@ -520,8 +822,22 @@ class See3DConverterApp(ctk.CTk):
         super().__init__()
         ctk.set_appearance_mode("light")
         self.title(f"See3D - E57 Converter  v{APP_VERSION}")
-        self.geometry("900x740")
-        self.minsize(820, 660)
+        # Open tall enough that every idle control is visible without
+        # scrolling AND the 800x300 native-resolution converting-video
+        # viewport drops in cleanly below the CONVERT button when a job
+        # starts. On smaller screens (13" MacBook, low-res Windows
+        # laptops) clamp to the actual usable display height so the
+        # window doesn't open partly off-screen -- viewport may then
+        # scroll during conversion, but idle state still fits.
+        desired_w, desired_h = 900, 1100
+        try:
+            screen_h = self.winfo_screenheight()
+            chrome = 95 if sys.platform == "darwin" else 80  # menu/dock vs taskbar
+            actual_h = min(desired_h, max(720, screen_h - chrome))
+        except Exception:
+            actual_h = desired_h
+        self.geometry(f"{desired_w}x{actual_h}")
+        self.minsize(820, 720)
         self.configure(fg_color=C_BG)
         _set_app_icon(self)
 
@@ -569,11 +885,7 @@ class See3DConverterApp(ctk.CTk):
         self.destroy()
 
     def _safe_after(self, ms: int, fn):
-        try:
-            if self.winfo_exists():
-                self.after(ms, fn)
-        except tk.TclError:
-            pass
+        _safe_schedule(self, ms, fn)
 
     # ---- shell ----
     def _build_ui(self):
@@ -773,30 +1085,40 @@ class See3DConverterApp(ctk.CTk):
                                          justify="left", wraplength=820)
         self._summary_lbl.grid(row=0, column=0, sticky="ew", padx=14, pady=8)
 
-        # Convert button + progress
+        # Convert button + progress. Two widgets occupy the same grid slot
+        # and we toggle which is visible:
+        #   - _conv_btn:    standard CTkButton (idle / done / retry / error)
+        #   - _conv_shim:   canvas-based banner with fill + shimmer (running)
         self._conv_btn = ctk.CTkButton(
             tab, text="CONVERT", height=46,
             fg_color=C_NAVY, hover_color=C_ACCENT2, text_color="white",
             font=_f(14, "bold"), corner_radius=8, command=self._start_conversion)
-        self._conv_btn.grid(row=r, column=0, sticky="ew", padx=2, pady=(10, 0)); r += 1
+        self._conv_btn.grid(row=r, column=0, sticky="ew", padx=2, pady=(10, 0))
+
+        self._conv_shim = ShimmerProgressBanner(tab, height=46)
+        self._conv_shim.grid(row=r, column=0, sticky="ew", padx=2, pady=(10, 0))
+        self._conv_shim.grid_remove()
+        r += 1
 
         self._cancel_btn = ctk.CTkButton(
             tab, text="CANCEL", height=32,
             fg_color=C_CARD, hover_color="#FBE9EC", text_color=C_ERROR_SOFT,
             border_color=C_ERROR_SOFT, border_width=2,
             font=_f(11, "bold"), corner_radius=8, command=self._request_cancel)
-        self._cancel_btn.grid(row=r, column=0, sticky="ew", padx=2, pady=(4, 0)); r += 1
+        self._cancel_btn.grid(row=r, column=0, sticky="ew", padx=2, pady=(6, 0)); r += 1
         self._cancel_btn.grid_remove()
 
-        self._prog = ctk.CTkProgressBar(
-            tab, fg_color=C_BORDER, progress_color=C_ACCENT, height=6, corner_radius=3)
-        self._prog.grid(row=r, column=0, sticky="ew", padx=2, pady=(5, 0)); r += 1
-        self._prog.set(0)
-        self._prog.grid_remove()
+        self._convideo = ConvertingVideo(tab, anim_rel="assets/converting_loop.webp",
+                                          nominal_w=800, nominal_h=300)
+        self._convideo.grid(row=r, column=0, padx=2, pady=(16, 0)); r += 1
+        self._convideo.grid_remove()
 
+        # Phase caption beneath the viewport. Bumped from C_DIM/10 to
+        # C_ACCENT2/11-bold so it competes with the 308 px viewport rather
+        # than disappearing under it.
         self._stat_lbl = ctk.CTkLabel(tab, text="", fg_color="transparent",
-                                      text_color=C_DIM, font=_f(10))
-        self._stat_lbl.grid(row=r, column=0, pady=(2, 8)); r += 1
+                                      text_color=C_ACCENT2, font=_f(11, "bold"))
+        self._stat_lbl.grid(row=r, column=0, pady=(12, 8)); r += 1
 
         # Post-conversion actions
         self._post_row = ctk.CTkFrame(tab, fg_color="transparent")
@@ -948,7 +1270,7 @@ class See3DConverterApp(ctk.CTk):
         if (_img_dir.is_dir()
                 and not self._dropzone.get_images()
                 and any(f.suffix.lower() in _IMG_EXTS for f in _img_dir.iterdir())):
-            self._dropzone._set_images(str(_img_dir))
+            self._dropzone.set_images(str(_img_dir))
         if not self._out_var.get():
             self._set_output(str(root / "Colmap"))
         # Cross-fill the Validate tab so the user doesn't re-enter paths.
@@ -956,10 +1278,10 @@ class See3DConverterApp(ctk.CTk):
         # immediately reads "Missing: cameras.txt, images.txt" before the
         # conversion has even been run.
         if not self._val_drop.var_e57.get():
-            self._val_drop._set_e57(path)
+            self._val_drop.set_e57(path)
         colmap_dir = root / "Colmap"
         if colmap_dir.is_dir() and not self._val_drop.var_images.get():
-            self._val_drop._set_images(str(colmap_dir))
+            self._val_drop.set_images(str(colmap_dir))
         self._refresh_summary()
 
     def _on_images_change(self, path: str):
@@ -1027,7 +1349,7 @@ class See3DConverterApp(ctk.CTk):
 
     def _poll(self):
         try:
-            while True:
+            for _ in range(50):   # cap per cycle so a log burst can't block repaints
                 kind, msg = self._q.get_nowait()
                 if kind == "log":
                     self._append_log(msg)
@@ -1048,13 +1370,10 @@ class See3DConverterApp(ctk.CTk):
             frac, phase = payload
         else:
             frac, phase = float(payload), ""
-        self._prog.set(frac)
-        if phase:
-            self._stat_lbl.configure(text=f"{phase}  ({int(frac * 100)}%)",
-                                     text_color=C_ACCENT2)
-        else:
-            self._stat_lbl.configure(text=f"Converting...  {int(frac * 100)}%",
-                                     text_color=C_ACCENT2)
+        pct = int(max(0.0, min(1.0, float(frac))) * 100)
+        self._conv_shim.set_progress(float(frac))
+        self._conv_shim.set_text(f"Converting... {pct}%")
+        self._stat_lbl.configure(text=phase, text_color=C_ACCENT2)
 
     # ---- conversion ----
     def _preflight(self, e57: str, images: str, output: str) -> str | None:
@@ -1067,7 +1386,6 @@ class See3DConverterApp(ctk.CTk):
         if not imgp.is_dir():
             return f"Panoramas folder not found:\n{imgp}"
         try:
-            from converter_core import count_panoramas, get_e57_scan_count
             n_img = count_panoramas(imgp)
             if n_img == 0:
                 return f"No JPG/PNG panoramas in:\n{imgp}"
@@ -1104,8 +1422,10 @@ class See3DConverterApp(ctk.CTk):
                     f"{outp} already contains files.\n"
                     "Continue and overwrite the conversion?"):
                     return "Cancelled by user."
-        except Exception:
-            pass
+        except PermissionError as exc:
+            return f"Cannot read output folder (permission denied):\n{exc}"
+        except OSError:
+            pass  # non-existent or unreadable — conversion will create it
         return None
 
     def _start_conversion(self):
@@ -1150,14 +1470,32 @@ class See3DConverterApp(ctk.CTk):
             messagebox.showerror("Invalid advanced setting", str(exc))
             return
 
+        # Snapshot BooleanVars on the main thread — tkinter vars are not
+        # thread-safe; reading them inside the worker can corrupt Tcl state.
+        include_nadir = not self.var_4face.get()
+        run_validate  = self.var_validate.get()
+
         self._converting = True
         self._cancel_event.clear()
-        self._conv_btn.configure(state="disabled", text="Converting...")
+        # Swap CTkButton out for the shimmer banner while running.
+        self._conv_btn.grid_remove()
+        self._conv_shim.set_progress(0.0)
+        self._conv_shim.set_text("Starting...")
+        self._conv_shim.grid()
+        self._conv_shim.start()
         self._cancel_btn.grid()
         self._post_row.grid_remove()
-        self._prog.grid()
-        self._prog.configure(mode="determinate")
-        self._prog.set(0)
+        # Stage the viewport reveal ~220 ms after the banner so the
+        # idle->converting transition feels intentional rather than an
+        # instant pop.  nudge_to_converting() switches the placeholder text
+        # only if no real progress callback has arrived yet.
+        def _stage2():
+            if not self._converting:
+                return
+            self._convideo.grid()
+            self._convideo.start()
+            self._conv_shim.nudge_to_converting()
+        self._safe_after(220, _stage2)
         self._stat_lbl.configure(text="Starting...", text_color=C_ACCENT2)
         self._clear_log()
         # Stay on the Convert tab so users watch the progress bar fill instead
@@ -1171,7 +1509,8 @@ class See3DConverterApp(ctk.CTk):
 
         threading.Thread(
             target=self._conv_worker,
-            args=(e57, images, output, face_size, workers, max_pts, seed, _cb),
+            args=(e57, images, output, face_size, workers, max_pts, seed,
+                  include_nadir, run_validate, _cb),
             daemon=True,
         ).start()
 
@@ -1183,60 +1522,75 @@ class See3DConverterApp(ctk.CTk):
         self._stat_lbl.configure(text="Cancelling...  (current step will finish first)",
                                  text_color=C_WARN)
 
-    def _conv_worker(self, e57, images, output, face_size, workers, max_pts, seed, cb):
+    def _conv_worker(self, e57, images, output, face_size, workers, max_pts, seed,
+                     include_nadir: bool, run_validate: bool, cb):
+        # include_nadir and run_validate are snapshotted from BooleanVars on the
+        # main thread before launch — tkinter vars are not thread-safe.
         import numpy as np
-        from converter_core import run_conversion, validate_conversion
         qs = _QS(self._q)
-        old_out, old_err = sys.stdout, sys.stderr
-        sys.stdout = qs
-        sys.stderr = qs
         validation_failed_msg = None
-        try:
-            run_conversion(
-                images_dir=Path(images), points_path=Path(e57),
-                colmap_dir=Path(output), face_size=face_size, yaw_offset_deg=0.0,
-                workers=workers, max_points=max_pts if max_pts > 0 else None,
-                camera_offset=np.zeros(3), seed=seed,
-                include_nadir_zenith=not self.var_4face.get(),
-                progress_callback=cb,
-                cancel_event=self._cancel_event,
-            )
-            if self.var_validate.get() and not self._cancel_event.is_set():
-                print("\n-- Alignment validation -----------------------------")
-                try:
-                    validate_conversion(colmap_dir=Path(output), e57_path=Path(e57))
-                except Exception as v_exc:
-                    import traceback
-                    validation_failed_msg = str(v_exc)
-                    print(f"\nValidation skipped: {v_exc}\n{traceback.format_exc()}")
-            if self._cancel_event.is_set():
+        with contextlib.redirect_stdout(qs), contextlib.redirect_stderr(qs):
+            try:
+                run_conversion(
+                    images_dir=Path(images), points_path=Path(e57),
+                    colmap_dir=Path(output), face_size=face_size, yaw_offset_deg=0.0,
+                    workers=workers, max_points=max_pts if max_pts > 0 else None,
+                    camera_offset=np.zeros(3), seed=seed,
+                    include_nadir_zenith=include_nadir,
+                    progress_callback=cb,
+                    cancel_event=self._cancel_event,
+                )
+                if run_validate and not self._cancel_event.is_set():
+                    print("\n-- Alignment validation -----------------------------")
+                    try:
+                        val_score = validate_conversion(
+                            colmap_dir=Path(output), e57_path=Path(e57))
+                        if val_score is None:
+                            validation_failed_msg = (
+                                "validation produced no score (no valid projections)")
+                    except Exception as v_exc:
+                        import traceback
+                        validation_failed_msg = str(v_exc)
+                        print(f"\nValidation skipped: {v_exc}\n{traceback.format_exc()}")
+                if self._cancel_event.is_set():
+                    self._q.put(("error", "Cancelled by user"))
+                else:
+                    done_msg = "Conversion complete."
+                    if validation_failed_msg:
+                        done_msg += f" (validation skipped — {validation_failed_msg})"
+                    self._q.put(("done", done_msg))
+            except InterruptedError:
                 self._q.put(("error", "Cancelled by user"))
-            else:
-                done_msg = "Conversion complete."
-                if validation_failed_msg:
-                    done_msg += " (validation skipped - see log)"
-                self._q.put(("done", done_msg))
-        except InterruptedError:
-            self._q.put(("error", "Cancelled by user"))
-        except Exception as exc:
-            import traceback
-            self._q.put(("log", f"\n--- ERROR ---\n{exc}\n{traceback.format_exc()}\n"))
-            self._q.put(("error", str(exc)))
-        finally:
-            sys.stdout = old_out
-            sys.stderr = old_err
+            except Exception as exc:
+                import traceback
+                self._q.put(("log", f"\n--- ERROR ---\n{exc}\n{traceback.format_exc()}\n"))
+                self._q.put(("error", str(exc)))
 
     def _on_done(self, success: bool, message: str):
         self._converting = False
         self._cancel_btn.grid_remove()
         self._cancel_btn.configure(state="normal", text="CANCEL")
+        self._convideo.stop()
+        self._convideo.grid_remove()
         if success:
-            self._prog.set(1.0)
-            self._conv_btn.configure(state="normal", text="CONVERT AGAIN", fg_color=C_NAVY)
+            # Linger on a fully-filled cyan banner with "Done ✓" before
+            # swapping back to the CTkButton -- a small celebratory beat
+            # so the transition doesn't feel abrupt.
+            self._conv_shim.set_success("Done ✓")
             self._stat_lbl.configure(text=f"Done - {message}", text_color=C_SUCCESS)
             self._post_row.grid()
+            def _swap_back():
+                self._conv_shim.grid_remove()
+                self._conv_btn.grid()
+                self._conv_btn.configure(state="normal", text="CONVERT AGAIN",
+                                         fg_color=C_NAVY)
+            self._safe_after(1500, _swap_back)
         else:
-            self._prog.set(0)
+            # Failures swap back immediately -- no celebratory linger when
+            # something broke.
+            self._conv_shim.stop()
+            self._conv_shim.grid_remove()
+            self._conv_btn.grid()
             self._conv_btn.configure(state="normal", text="RETRY", fg_color=C_ERROR_SOFT)
             self._stat_lbl.configure(text=f"Failed - {message}", text_color=C_ERROR)
             self._post_row.grid_remove()
@@ -1277,34 +1631,28 @@ class See3DConverterApp(ctk.CTk):
         threading.Thread(target=self._val_worker, args=(colmap, e57), daemon=True).start()
 
     def _val_worker(self, colmap: str, e57: str):
-        from converter_core import validate_conversion, get_available_scans, generate_overlay
         qs = _QS(self._q)
-        old_out, old_err = sys.stdout, sys.stderr
-        sys.stdout = qs
-        sys.stderr = qs
-        try:
-            score = validate_conversion(Path(colmap), Path(e57))
-            overlays, labels = [], []
+        with contextlib.redirect_stdout(qs), contextlib.redirect_stderr(qs):
             try:
-                scans = get_available_scans(Path(colmap))
-                if scans:
-                    picks = sorted({scans[0], scans[len(scans) // 2], scans[-1]})
-                    for sid in picks:
-                        print(f"Generating overlay for scan {sid}...")
-                        img = generate_overlay(Path(colmap), Path(e57),
-                                               scan_id=sid, face="pz")
-                        overlays.append(img)
-                        labels.append(f"Scan {sid}  -  pz face")
-            except Exception as oe:
-                print(f"Note: overlay generation skipped - {oe}")
-            self._q.put(("val_done", (score, overlays, labels)))
-        except Exception as exc:
-            import traceback
-            self._q.put(("log", f"\nValidation ERROR: {exc}\n{traceback.format_exc()}\n"))
-            self._q.put(("val_done", (None, [], [])))
-        finally:
-            sys.stdout = old_out
-            sys.stderr = old_err
+                score = validate_conversion(Path(colmap), Path(e57))
+                overlays, labels = [], []
+                try:
+                    scans = get_available_scans(Path(colmap))
+                    if scans:
+                        picks = sorted({scans[0], scans[len(scans) // 2], scans[-1]})
+                        for sid in picks:
+                            print(f"Generating overlay for scan {sid}...")
+                            img = generate_overlay(Path(colmap), Path(e57),
+                                                   scan_id=sid, face="pz")
+                            overlays.append(img)
+                            labels.append(f"Scan {sid}  -  pz face")
+                except Exception as oe:
+                    print(f"Note: overlay generation skipped - {oe}")
+                self._q.put(("val_done", (score, overlays, labels)))
+            except Exception as exc:
+                import traceback
+                self._q.put(("log", f"\nValidation ERROR: {exc}\n{traceback.format_exc()}\n"))
+                self._q.put(("val_done", (None, [], [])))
 
     def _on_val_done(self, payload):
         score, overlays, labels = payload
@@ -1337,7 +1685,7 @@ class See3DConverterApp(ctk.CTk):
         if overlays:
             self._ovr_imgs = overlays
             self._ovr_lbls = labels
-            self._ovr_idx = min(1, len(overlays) - 1)
+            self._ovr_idx = 0
             self._show_ovr(self._ovr_idx)
             self._ovr_frame.grid()
         self._switch("Validate")

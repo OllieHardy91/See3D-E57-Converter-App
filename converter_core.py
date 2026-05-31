@@ -856,7 +856,7 @@ def validate_conversion(
 
     if all_diffs:
         overall = weighted_sum / total_pts if total_pts else float("nan")
-        status = "GOOD" if overall <= 10 else "HIGH - check inputs"
+        status = "GOOD" if overall <= 9 else "HIGH - check inputs"
         print(f"\n  Overall: mean={np.mean(all_diffs):.2f}  weighted={overall:.2f}  [{status}]")
         print(f"  Expected range for a healthy M2 capture: 5-9")
         return overall

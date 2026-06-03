@@ -36,18 +36,12 @@ jobs:
       - name: Build app_icon.ico (hybrid wordmark/squircle)
         run: python scripts/generate_icon_source.py
 
-      - name: Compute tkdnd path
-        run: |
-          $p = python -c "import tkinterdnd2, os; print(os.path.join(os.path.dirname(tkinterdnd2.__file__), 'tkdnd'))"
-          "TKDND_PATH=$p" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-
       - name: Build EXE
         run: |
           python -m PyInstaller --onefile --windowed --noconfirm --noupx `
             --name "See3D_E57_Converter" `
             --icon "assets/app_icon.ico" `
             --add-data "assets;assets" `
-            --add-data "$env:TKDND_PATH;tkinterdnd2/tkdnd" `
             --hidden-import numpy `
             --hidden-import scipy `
             --hidden-import scipy.spatial `
@@ -62,6 +56,7 @@ jobs:
             --hidden-import customtkinter `
             --hidden-import tkinterdnd2 `
             --collect-data customtkinter `
+            --collect-all tkinterdnd2 `
             --collect-data cv2 `
             --collect-binaries cv2 `
             --collect-binaries pye57 `

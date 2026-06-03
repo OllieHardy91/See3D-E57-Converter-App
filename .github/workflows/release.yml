@@ -159,7 +159,9 @@ jobs:
 
       - name: Zip .app for upload
         working-directory: dist
-        run: zip -r See3D_E57_Converter-mac.zip See3D_E57_Converter.app
+        run: |
+          cp "../First Launch.command" .
+          zip -r See3D_E57_Converter-mac.zip See3D_E57_Converter.app "First Launch.command"
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')

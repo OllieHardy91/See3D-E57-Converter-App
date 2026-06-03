@@ -33,9 +33,8 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
 
-      - name: Build app_icon.ico from Final_Icon.png
-        run: |
-          python -c "from PIL import Image; img = Image.open('assets/Final_Icon.png').convert('RGBA'); img.save('assets/app_icon.ico', format='ICO', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+      - name: Build app_icon.ico (hybrid wordmark/squircle)
+        run: python scripts/generate_icon_source.py
 
       - name: Compute tkdnd path
         run: |
